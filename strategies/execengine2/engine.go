@@ -28,7 +28,8 @@ type Setup struct {
 // Каждое изменяемое состояние хранится только в одной части.
 //
 // Все методы Engine надо вызывать из одной горутины цикла событий.
-// Сам движок не запускает горутины и не держит мьютексы.
+// ModeMarket отправляет две заявки параллельно и ждёт оба ответа; состояние
+// меняется только в вызывающей горутине. Постоянных горутин и мьютексов нет.
 type Engine struct {
 	config   Config
 	broker   Broker
@@ -55,6 +56,7 @@ type Info struct {
 	Position      int
 	LimitLeft     int64
 	MarketOrders  int
+	UnknownOrders int
 	Hedges        int
 	OrdersToClose int
 }
@@ -103,7 +105,8 @@ func (e *Engine) OnBook(
 	if !e.quotes.Update(symbol, at, bestBid, bestAsk) {
 		return nil
 	}
-	if !e.HasTrade() {
+	clip, active := e.trade.Info()
+	if !active || clip.Stopping {
 		return nil
 	}
 	staleA, staleB := e.quotes.TooOld(at, e.config.BookMaxAge)
@@ -158,7 +161,7 @@ func (e *Engine) OnSignal(ctx context.Context, state Signal) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
-	if !e.state.CanOpen() || e.HasTrade() || e.hedges.MarketCount() > 0 ||
+	if !e.state.CanOpen() || e.HasTrade() || e.hedges.HasWork() ||
 		!e.quotes.Ready(state.Time, e.config.BookMaxAge) {
 		return nil
 	}
@@ -190,10 +193,13 @@ func (e *Engine) OnSignal(ctx context.Context, state Signal) error {
 	requests, err := e.trade.Start(
 		plan, mode, e.config.LegA, e.config.LegB,
 		e.quotes.Prices(model.LegA), e.quotes.Prices(model.LegB),
-		lots, e.config.Ratio, state.Time, e.config.TradeTimeout,
+		lots, e.config.Ratio, state.Time, e.config.TradeTimeout, e.strategy.Position(),
 	)
 	if err != nil {
 		return err
+	}
+	if mode == model.ModeMarket {
+		return e.openMarket(ctx, requests, state.Time)
 	}
 	for _, req := range requests {
 		orderID, placeErr := e.broker.Place(ctx, req)
@@ -283,8 +289,8 @@ func (e *Engine) OnTick(ctx context.Context, now time.Time) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
-	var result error
-	if e.HasTrade() {
+	result := e.resumeUnknown(ctx, now)
+	if clip, active := e.trade.Info(); active && !clip.Stopping {
 		staleA, staleB := e.quotes.TooOld(now, e.config.BookMaxAge)
 		if staleA || staleB || e.trade.TooLate(now) {
 			result = errors.Join(result, e.stopTrade(ctx, "clip timeout or stale book", true))
@@ -293,6 +299,19 @@ func (e *Engine) OnTick(ctx context.Context, now time.Time) error {
 	result = errors.Join(result, e.checkMarketOrders(ctx, now))
 	if e.state.FixDue(now) {
 		result = errors.Join(result, e.fixWork(ctx, now))
+	}
+	if clip, ok := e.trade.Info(); ok && e.hedges.UnknownCount() == 0 &&
+		len(e.hedges.All()) == 0 && len(e.orders.OrdersToClose()) == 0 &&
+		e.state.Info().Code != run.Stopped {
+		if clip.Stopping {
+			result = errors.Join(result, e.stopTrade(ctx, "finishing recovered clip", true))
+		} else {
+			// Maker fills may have accumulated while an earlier hedge was unknown.
+			result = errors.Join(result, e.hedgeTrade(ctx, model.RoleHedge))
+			if e.trade.Full() {
+				e.finishTrade(now, false)
+			}
+		}
 	}
 	return result
 }
@@ -317,6 +336,7 @@ func (e *Engine) Stop(ctx context.Context, reason string) error {
 
 // CheckPositions сравнивает позицию брокера с позицией стратегии.
 func (e *Engine) CheckPositions(actualA, actualB int) bool {
+	e.confirmUnknownPositions(actualA, actualB)
 	expectedA := e.strategy.Position()
 	expectedB := -expectedA * e.config.Ratio
 	hasWork := e.HasTrade() || len(e.orders.OrdersToClose()) > 0 || e.hedges.HasWork()
@@ -358,6 +378,7 @@ func (e *Engine) Info() Info {
 		Code: state.Code, Reason: state.Reason, HasTrade: e.HasTrade(),
 		Position: e.Position(), LimitLeft: e.limit.Remaining(),
 		MarketOrders: e.hedges.MarketCount(), Hedges: len(e.hedges.All()),
+		UnknownOrders: e.hedges.UnknownCount(),
 		OrdersToClose: len(e.orders.OrdersToClose()),
 	}
 }
@@ -508,6 +529,9 @@ func (e *Engine) fixLateFill(ctx context.Context, maker model.OrderRequest, lots
 
 func (e *Engine) hedgeTrade(ctx context.Context, role model.OrderRole) error {
 	for range 2 {
+		if e.hedges.UnknownCount() > 0 || len(e.hedges.All()) > 0 {
+			return nil // pending work must be resolved before sizing another hedge
+		}
 		req, ok, err := e.trade.Hedge(role)
 		if err != nil {
 			e.halt(err.Error())
@@ -527,27 +551,74 @@ func (e *Engine) hedgeTrade(ctx context.Context, role model.OrderRole) error {
 }
 
 func (e *Engine) placeHedge(ctx context.Context, req model.OrderRequest) error {
+	remaining := req.Lots
+	size := remaining
+	shrinking := e.config.RejectRetryLotStep > 0
+	tries := e.config.HedgeTries
 	var lastErr error
-	for range e.config.HedgeTries {
+	// The ladder terminates: each success pays at least one owed lot, and each
+	// rejection reduces size until one lot is rejected. HedgeTries then bounds
+	// the ordinary full-remainder attempts, just as when the ladder is disabled.
+	for shrinking || tries > 0 {
+		if !shrinking {
+			size = remaining
+			tries--
+		}
 		if !e.limit.Take(1, model.LimitMust) {
 			reason := "placement budget rejected a mandatory hedge"
+			req.Lots = remaining
+			e.hedges.Add(req, errors.New(reason))
 			e.halt(reason)
 			return errors.New(reason)
 		}
-		orderID, err := e.broker.Place(ctx, req)
+		part := req
+		part.Lots = size
+		orderID, err := e.broker.Place(ctx, part)
 		if err == nil {
-			return e.addOrder(orderID, req)
+			remaining -= size
+			if err := e.addOrder(orderID, part); err != nil {
+				if remaining > 0 {
+					req.Lots = remaining
+					e.hedges.Add(req, err)
+				}
+				return err
+			}
+			if remaining == 0 {
+				return nil
+			}
+			if e.state.Info().Code == run.CheckNeeded || e.state.Info().Code == run.Stopped {
+				req.Lots = remaining
+				e.hedges.Add(req, nil)
+				e.state.StartFix(e.clock.Now(), e.config.RetryWait, "remaining hedge volume after unverified acceptance")
+				return nil
+			}
+			size = min(size, remaining)
+			continue
 		}
 		lastErr = err
 		if OrderMayExist(err) {
 			orderID, _ := ErrorClientID(err)
-			e.acceptUntrackedMarket(req, orderID, "mandatory placement outcome is unknown")
+			e.rememberUnknown(part, err, true)
+			e.acceptUntrackedMarket(part, orderID, "mandatory placement outcome is unknown")
+			remaining -= size
+			if remaining > 0 {
+				req.Lots = remaining
+				e.hedges.Add(req, err)
+			}
 			return nil
 		}
+		if shrinking {
+			if size == 1 {
+				shrinking = false
+			} else {
+				size = max(1, size-e.config.RejectRetryLotStep)
+			}
+		}
 	}
+	req.Lots = remaining
 	e.hedges.Add(req, lastErr)
 	e.state.StartFix(e.clock.Now(), e.config.RetryWait, "mandatory hedge placement failed")
-	e.logger.Warnf("queued hedge debt on %s x%d after %d definitive failures", req.Symbol, req.Lots, e.config.HedgeTries)
+	e.logger.Warnf("queued hedge debt on %s x%d after exhausting placement retries", req.Symbol, req.Lots)
 	return lastErr
 }
 
@@ -579,7 +650,7 @@ func (e *Engine) closeOrder(ctx context.Context, orderID string) (orders.Change,
 }
 
 func (e *Engine) stopTrade(ctx context.Context, reason string, allowBalance bool) error {
-	if e.state.Info().Code == run.Stopped {
+	if e.state.Info().Code == run.Stopped || e.hedges.UnknownCount() > 0 {
 		allowBalance = false
 	}
 	ids := e.trade.Stop()
@@ -596,7 +667,9 @@ func (e *Engine) stopTrade(ctx context.Context, reason string, allowBalance bool
 	}
 	if !allowBalance {
 		e.state.NeedCheck(reason + ": placement outcome unknown")
-		e.trade.DropEmpty()
+		if e.hedges.UnknownCount() == 0 {
+			e.trade.DropEmpty()
+		}
 		return result
 	}
 	if len(e.hedges.All()) == 0 {
@@ -686,7 +759,9 @@ func (e *Engine) fixWork(ctx context.Context, now time.Time) error {
 		if err != nil {
 			if OrderMayExist(err) {
 				e.hedges.Done(debt.ID)
-				e.state.NeedCheck("recovery hedge placement outcome is unknown")
+				e.rememberUnknown(debt.Request, err, true)
+				clientID, _ := ErrorClientID(err)
+				e.acceptUntrackedMarket(debt.Request, clientID, "recovery hedge placement outcome is unknown")
 				e.logger.Criticalf("recovery hedge became ambiguous: %v", err)
 			} else {
 				e.hedges.Fail(debt.ID, err)
@@ -700,7 +775,7 @@ func (e *Engine) fixWork(ctx context.Context, now time.Time) error {
 		e.hedges.Done(debt.ID)
 		didWork = true
 	}
-	remaining := len(e.orders.OrdersToClose()) + len(e.hedges.All()) + e.hedges.MarketCount()
+	remaining := len(e.orders.OrdersToClose()) + len(e.hedges.All()) + e.hedges.MarketCount() + e.hedges.UnknownCount()
 	e.state.FixDone(
 		now, remaining, didWork, e.config.RetryWait, e.config.RetryMax,
 	)

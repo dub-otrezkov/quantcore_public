@@ -24,7 +24,13 @@ type Config struct {
 	RetryMax         time.Duration
 	MarketCheckAfter time.Duration
 	MarketCheckEvery time.Duration
-	HedgeTries       int
+	// HedgeTries bounds ordinary attempts at the remaining hedge size. When
+	// RejectRetryLotStep is positive, these follow the finite shrinking ladder.
+	HedgeTries int
+	// RejectRetryLotStep enables smaller retries after definitive rejections.
+	// Opening entries keep their requested size; mandatory hedges accumulate
+	// accepted chunks toward the full obligation. Zero disables the ladder.
+	RejectRetryLotStep int
 
 	LogTag string
 }
@@ -85,6 +91,9 @@ func (c Config) validate() error {
 	}
 	if c.HedgeTries < 1 {
 		return errors.New("hedge retries must be at least one")
+	}
+	if c.RejectRetryLotStep < 0 {
+		return errors.New("reject retry lot step must not be negative")
 	}
 	return nil
 }

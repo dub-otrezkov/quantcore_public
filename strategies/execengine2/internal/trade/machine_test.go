@@ -15,7 +15,7 @@ func startDual(t *testing.T, target int) (*trade.Trade, time.Time) {
 	reqs, err := m.Start(
 		execengine2.Plan{Action: 1, Lots: target}, execengine2.ModeTwoLimits,
 		"A", "B", execengine2.Prices{Bid: 99, Ask: 100},
-		execengine2.Prices{Bid: 199, Ask: 200}, target, 1, now, time.Minute,
+		execengine2.Prices{Bid: 199, Ask: 200}, target, 1, now, time.Minute, 0,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestBadRatioReturnsError(t *testing.T) {
 	reqs, err := m.Start(
 		execengine2.Plan{Action: 1}, execengine2.ModeMarket, "A", "B",
 		execengine2.Prices{Bid: 99, Ask: 100}, execengine2.Prices{Bid: 199, Ask: 200},
-		1, 10, now, 0,
+		1, 10, now, 0, 0,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -126,5 +126,32 @@ func TestPriceChangeWait(t *testing.T) {
 		now.Add(4*time.Second), 2*time.Second, 0,
 	); ok {
 		t.Fatal("repeg ignored per-leg throttle")
+	}
+}
+
+func TestBasePositionSurvivesPlacementAccounting(t *testing.T) {
+	t.Parallel()
+	var m trade.Trade
+	now := time.Now()
+	const initialPosition = -3
+	reqs, err := m.Start(
+		execengine2.Plan{Action: 1}, execengine2.ModeMarket, "A", "B",
+		execengine2.Prices{Bid: 99, Ask: 100}, execengine2.Prices{Bid: 199, Ask: 200},
+		2, 1, now, 0, initialPosition,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range reqs {
+		if !m.AddMarket(req.TradeID, req.Leg, req.Lots) {
+			t.Fatal("market placement was not accounted")
+		}
+	}
+	if !m.FixMarket(reqs[1].TradeID, execengine2.LegB, -1) {
+		t.Fatal("partial execution was not accounted")
+	}
+	info, ok := m.Info()
+	if !ok || info.BasePosition != initialPosition || info.FilledA != 2 || info.FilledB != 1 {
+		t.Fatalf("initial position changed during placement accounting: %+v", info)
 	}
 }

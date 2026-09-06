@@ -7,6 +7,8 @@ import (
 
 // Broker — единая точка работы движка с брокером.
 // Context приходит от вызывающего кода и не заменяется внутри.
+// Place должен поддерживать два одновременных вызова для ног ModeMarket.
+// Engine ждёт оба ответа до изменения состояния или других вызовов Broker.
 type Broker interface {
 	Place(ctx context.Context, req OrderRequest) (orderID string, err error)
 	Cancel(ctx context.Context, orderID string) (CancelResult, error)

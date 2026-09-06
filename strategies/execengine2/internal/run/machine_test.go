@@ -54,3 +54,22 @@ func TestFixWaitAndStop(t *testing.T) {
 		t.Fatal("halted machine resurrected")
 	}
 }
+
+func TestPositionChecksPreserveOutstandingRetries(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	var m run.State
+	m.StartFix(now, time.Second, "hedge debt")
+	m.NeedCheck("another placement became unknown")
+	if m.CheckPositions(0, 0, 0, 0, true) || !m.FixDue(now.Add(time.Second)) {
+		t.Fatal("reconciliation discarded pending retry work")
+	}
+	m.FixDone(now.Add(time.Second), 1, false, time.Second, time.Minute)
+	if m.FixDue(now.Add(2*time.Second)) || !m.FixDue(now.Add(3*time.Second)) {
+		t.Fatal("reconciliation disabled retry backoff")
+	}
+	m.Stop("manual")
+	if m.FixDue(now.Add(time.Hour)) {
+		t.Fatal("stopped state allowed a retry")
+	}
+}

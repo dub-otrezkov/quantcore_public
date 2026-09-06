@@ -67,7 +67,7 @@ func (m *State) StartFix(now time.Time, firstWait time.Duration, reason string) 
 
 // FixDue проверяет время следующей попытки.
 func (m *State) FixDue(now time.Time) bool {
-	return m.code == Fixing && !now.Before(m.nextTry)
+	return m.code != Stopped && !m.nextTry.IsZero() && !now.Before(m.nextTry)
 }
 
 // FixDone выбирает время следующей попытки или просит проверить позиции.
@@ -78,7 +78,7 @@ func (m *State) FixDone(
 	firstWait time.Duration,
 	maxWait time.Duration,
 ) {
-	if m.code != Fixing {
+	if m.code == Stopped || m.nextTry.IsZero() {
 		return
 	}
 	if left == 0 {
@@ -109,8 +109,6 @@ func (m *State) NeedCheck(reason string) {
 	}
 	m.code = CheckNeeded
 	m.reason = reason
-	m.nextTry = time.Time{}
-	m.wait = 0
 }
 
 // CheckPositions возвращает Ready только при равных позициях и без другой работы.
@@ -118,7 +116,11 @@ func (m *State) CheckPositions(brokerA, brokerB, strategyA, strategyB int, hasWo
 	if m.code == Stopped {
 		return false
 	}
-	if hasWork || brokerA != strategyA || brokerB != strategyB {
+	if hasWork {
+		// A position poll must not discard scheduled cancel/hedge retries.
+		return false
+	}
+	if brokerA != strategyA || brokerB != strategyB {
 		m.code = CheckNeeded
 		m.reason = "broker and engine positions differ"
 		return false

@@ -276,8 +276,12 @@ func (v2HarnessEngine) Build(
 	if err != nil {
 		t.Fatalf("execengine2 gateway: %v", err)
 	}
+	mode := execengine2.ModeTwoLimits
+	if cfg.ec.TakerOnly {
+		mode = execengine2.ModeMarket
+	}
 	engine, err := execengine2.NewEngine(execengine2.Config{
-		LegA: cfg.ec.LegA, LegB: cfg.ec.LegB, Lots: cfg.ec.OrderVol, Mode: execengine2.ModeTwoLimits,
+		LegA: cfg.ec.LegA, LegB: cfg.ec.LegB, Lots: cfg.ec.OrderVol, Mode: mode,
 		BookMaxAge: cfg.ec.MaxStaleness, PriceWait: cfg.ec.RepegThrottle, MinRest: cfg.ec.MinRest,
 		TradeTimeout: cfg.ec.FillTimeout, RetryWait: cfg.ec.PlaceRetryBackoff,
 		MarketCheckAfter: 2 * time.Second, MarketCheckEvery: 300 * time.Millisecond,

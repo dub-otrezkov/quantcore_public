@@ -20,34 +20,36 @@ type legData struct {
 }
 
 type pair struct {
-	id       uint64
-	plan     model.Plan
-	mode     model.Mode
-	lotsA    int
-	ratio    int
-	legA     legData
-	legB     legData
-	first    model.Leg
-	stopping bool
-	endAt    time.Time
+	id           uint64
+	plan         model.Plan
+	mode         model.Mode
+	lotsA        int
+	ratio        int
+	legA         legData
+	legB         legData
+	first        model.Leg
+	stopping     bool
+	endAt        time.Time
+	basePosition int
 }
 
 // Info — копия текущей сделки для чтения.
 type Info struct {
-	ID       uint64
-	Plan     model.Plan
-	Mode     model.Mode
-	LotsA    int
-	Ratio    int
-	First    model.Leg
-	FilledA  int
-	FilledB  int
-	OrderA   string
-	OrderB   string
-	OpenA    bool
-	OpenB    bool
-	Stopping bool
-	EndAt    time.Time
+	ID           uint64
+	Plan         model.Plan
+	Mode         model.Mode
+	LotsA        int
+	Ratio        int
+	First        model.Leg
+	FilledA      int
+	FilledB      int
+	OrderA       string
+	OrderB       string
+	OpenA        bool
+	OpenB        bool
+	Stopping     bool
+	EndAt        time.Time
+	BasePosition int
 }
 
 // FillResult описывает итог исполнения лимитной заявки.
@@ -85,6 +87,7 @@ func (m *Trade) Start(
 	ratio int,
 	now time.Time,
 	maxTime time.Duration,
+	basePosition int,
 ) ([]model.OrderRequest, error) {
 	if m.current != nil {
 		return nil, errors.New("clip already working")
@@ -116,11 +119,12 @@ func (m *Trade) Start(
 	}
 	sideB := sideA.Other()
 	c := &pair{
-		id:    m.nextID,
-		plan:  plan,
-		mode:  mode,
-		lotsA: lotsA,
-		ratio: ratio,
+		id:           m.nextID,
+		plan:         plan,
+		mode:         mode,
+		lotsA:        lotsA,
+		ratio:        ratio,
+		basePosition: basePosition,
 	}
 	if maxTime > 0 {
 		c.endAt = now.Add(maxTime)
@@ -423,7 +427,7 @@ func (m *Trade) Info() (Info, bool) {
 		First: c.first, FilledA: c.legA.filled, FilledB: c.legB.filled,
 		OrderA: c.legA.orderID, OrderB: c.legB.orderID,
 		OpenA: c.legA.open, OpenB: c.legB.open,
-		Stopping: c.stopping, EndAt: c.endAt,
+		Stopping: c.stopping, EndAt: c.endAt, BasePosition: c.basePosition,
 	}, true
 }
 

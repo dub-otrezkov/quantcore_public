@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ type placeCall struct {
 }
 
 type fakeBroker struct {
+	mu        sync.Mutex
 	places    []placeCall
 	cancels   []string
 	statuses  []string
@@ -26,11 +28,14 @@ type fakeBroker struct {
 }
 
 func (b *fakeBroker) Place(ctx context.Context, req execengine2.OrderRequest) (string, error) {
+	b.mu.Lock()
 	b.places = append(b.places, placeCall{ctx: ctx, req: req})
+	call := len(b.places)
+	b.mu.Unlock()
 	if b.placeFunc != nil {
-		return b.placeFunc(ctx, req, len(b.places))
+		return b.placeFunc(ctx, req, call)
 	}
-	return fmt.Sprintf("o%d", len(b.places)), nil
+	return fmt.Sprintf("o%d", call), nil
 }
 
 func (b *fakeBroker) Cancel(_ context.Context, orderID string) (execengine2.CancelResult, error) {
@@ -290,8 +295,8 @@ func TestUnknownHedgeIsBlindCredited(t *testing.T) {
 	if len(f.sink.positions) != 2 || f.sink.positions[1].Lots != -2 {
 		t.Fatalf("blind hedge accounting = %+v", f.sink.positions)
 	}
-	if !f.engine.CheckPositions(2, -2) {
-		t.Fatal("clean position check did not confirm the untracked hedge")
+	if !f.engine.CheckPositions(2, -2) || f.engine.Info().UnknownOrders != 0 {
+		t.Fatal("full inventory confirmation did not resolve the credited hedge")
 	}
 }
 

@@ -46,9 +46,10 @@ type workItem struct {
 
 // List можно использовать с нулевым значением. Его карты не выходят из пакета.
 type List struct {
-	market map[string]*market
-	work   map[uint64]*workItem
-	nextID uint64
+	market  map[string]*market
+	work    map[uint64]*workItem
+	unknown []Unknown
+	nextID  uint64
 }
 
 func (m *List) init() {
@@ -176,7 +177,7 @@ func (m *List) Fail(id uint64, err error) bool {
 
 // HasWork проверяет, осталась ли работа.
 func (m *List) HasWork() bool {
-	return len(m.market) > 0 || len(m.work) > 0
+	return len(m.market) > 0 || len(m.work) > 0 || len(m.unknown) > 0
 }
 
 // MarketCount возвращает число рыночных заявок без подтверждения.
