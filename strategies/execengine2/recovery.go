@@ -87,13 +87,19 @@ func (e *Engine) resumeUnknown(ctx context.Context, now time.Time) error {
 	if e.state.Info().Code == run.Stopped {
 		return nil
 	}
-	resumer, ok := e.broker.(PlacementResumer)
-	if !ok {
-		return nil
-	}
+	resumer, canResume := e.broker.(PlacementResumer)
 	var result error
+	// The existing retry schedule also paces diagnostics for orders that cannot
+	// be resumed, so their reconciliation barrier has an operational explanation.
 	for _, pending := range e.hedges.UnknownDue(now, e.config.RetryWait) {
+		if !canResume {
+			e.logger.Warnf("broker cannot resume placements: %s on %s stays behind the reconciliation barrier",
+				pending.ClientID, pending.Request.Symbol)
+			continue
+		}
 		if pending.ClientID == "" {
+			e.logger.Warnf("no client id for an unknown placement on %s: it stays behind the reconciliation barrier",
+				pending.Request.Symbol)
 			continue // no safe idempotency key: keep the reconciliation barrier
 		}
 		orderID, err := resumer.ResumePlacement(ctx, pending.Request, pending.ClientID)

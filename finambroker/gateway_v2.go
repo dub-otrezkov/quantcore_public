@@ -256,6 +256,12 @@ func (g *Gateway) rememberPlacement(clientID string, req execengine2.OrderReques
 	if g.placements == nil {
 		g.placements = make(map[string]placementWindow)
 	}
+	now := g.timeNow()
+	for id, pending := range g.placements {
+		if !now.Before(pending.deadline) {
+			delete(g.placements, id)
+		}
+	}
 	g.placements[clientID] = placementWindow{request: req, deadline: deadline}
 }
 
