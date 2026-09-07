@@ -14,6 +14,7 @@ type Unknown struct {
 	Request  model.OrderRequest
 	Counted  bool
 	NextTry  time.Time
+	wait     time.Duration
 }
 
 func (m *List) AddUnknown(clientID string, req model.OrderRequest, counted bool, nextTry time.Time) {
@@ -23,15 +24,30 @@ func (m *List) AddUnknown(clientID string, req model.OrderRequest, counted bool,
 	})
 }
 
-// UnknownDue returns copies and paces retries independently of position checks.
-func (m *List) UnknownDue(now time.Time, wait time.Duration) []Unknown {
+// UnknownDue returns copies and backs off unresolved orders independently of
+// position checks and other debts. Resolving an order removes its schedule.
+func (m *List) UnknownDue(now time.Time, firstWait, maxWait time.Duration) []Unknown {
+	if firstWait <= 0 {
+		firstWait = time.Second
+	}
+	maxWait = max(firstWait, maxWait)
 	due := make([]Unknown, 0, len(m.unknown))
 	for i := range m.unknown {
-		if now.Before(m.unknown[i].NextTry) {
+		pending := &m.unknown[i]
+		if now.Before(pending.NextTry) {
 			continue
 		}
-		m.unknown[i].NextTry = now.Add(wait)
-		due = append(due, m.unknown[i])
+		if pending.wait < firstWait {
+			pending.wait = firstWait
+		}
+		// Clamp before multiplying so even a very large RetryMax cannot overflow.
+		if pending.wait > maxWait/2 {
+			pending.wait = maxWait
+		} else {
+			pending.wait *= 2
+		}
+		pending.NextTry = now.Add(pending.wait)
+		due = append(due, *pending)
 	}
 	return due
 }

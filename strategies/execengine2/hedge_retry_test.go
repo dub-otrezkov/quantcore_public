@@ -172,6 +172,163 @@ func TestHedgeShrinkKeepsOnlyUnplacedDebt(t *testing.T) {
 	}
 }
 
+func TestQueuedHedgeShrinksAndAccumulatesFullObligation(t *testing.T) {
+	t.Parallel()
+	e, broker, limit, updates := newHedgeRetryTest(t, 3, 1)
+	recovering := false
+	broker.place = func(req OrderRequest, call int) (string, error) {
+		if !recovering || req.Lots > 4 {
+			return "", NotPlaced(errors.New("size rejected"))
+		}
+		return fmt.Sprintf("hedge-%d", call), nil
+	}
+	if err := e.placeHedge(context.Background(), hedgeRetryRequest(10)); err == nil {
+		t.Fatal("initial rejection did not queue hedge debt")
+	}
+	recovering = true
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err != nil {
+		t.Fatal(err)
+	}
+	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4, 1, 10, 10, 7, 4, 4, 2})
+	if updates.lots != -10 || len(e.hedges.All()) != 0 || e.hedges.MarketCount() != 3 {
+		t.Fatalf("queued hedge was not paid exactly once: lots=%d debts=%+v pending=%d", updates.lots, e.hedges.All(), e.hedges.MarketCount())
+	}
+}
+
+func TestQueuedHedgeShrinkRequeuesOnlyUnplacedRemainder(t *testing.T) {
+	t.Parallel()
+	e, broker, limit, updates := newHedgeRetryTest(t, 3, 1)
+	broker.place = func(OrderRequest, int) (string, error) {
+		return "", NotPlaced(errors.New("unavailable"))
+	}
+	if err := e.placeHedge(context.Background(), hedgeRetryRequest(10)); err == nil {
+		t.Fatal("initial rejection did not queue hedge debt")
+	}
+	// A failed recovery backs off even though it replaces the queued record.
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err == nil {
+		t.Fatal("rejected recovery returned no error")
+	}
+	if e.state.Info().Wait != 2*e.config.RetryWait || len(e.hedges.All()) != 1 {
+		t.Fatalf("rejection did not preserve debt and backoff: state=%+v debts=%+v", e.state.Info(), e.hedges.All())
+	}
+	broker.requests = nil
+	limit.classes = nil
+	broker.place = func(_ OrderRequest, call int) (string, error) {
+		if call == 3 {
+			return "accepted-four", nil
+		}
+		return "", NotPlaced(errors.New("size rejected"))
+	}
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err == nil {
+		t.Fatal("partial recovery did not report its exhausted remainder")
+	}
+	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4, 4, 1, 6})
+	debts := e.hedges.All()
+	if len(debts) != 1 || debts[0].Request != hedgeRetryRequest(6) || updates.lots != -4 {
+		t.Fatalf("partial recovery duplicated or lost debt: lots=%d debts=%+v", updates.lots, debts)
+	}
+	if e.state.Info().Wait != e.config.RetryWait {
+		t.Fatalf("accepted chunk did not reset backoff: %+v", e.state.Info())
+	}
+	if err := e.OnOrderStatus(context.Background(), "accepted-four", OrderStatus{Done: true, Filled: 4}); err != nil {
+		t.Fatal(err)
+	}
+	broker.requests = nil
+	limit.classes = nil
+	broker.place = func(req OrderRequest, call int) (string, error) {
+		if req.Lots > 3 {
+			return "", NotPlaced(errors.New("size rejected"))
+		}
+		return fmt.Sprintf("remainder-%d", call), nil
+	}
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err != nil {
+		t.Fatal(err)
+	}
+	checkHedgeRetryAttempts(t, broker, limit, []int{6, 3, 3})
+	if updates.lots != -10 || len(e.hedges.All()) != 0 || e.hedges.MarketCount() != 2 {
+		t.Fatalf("remainder was not paid exactly once: lots=%d debts=%+v pending=%d", updates.lots, e.hedges.All(), e.hedges.MarketCount())
+	}
+}
+
+func TestQueuedHedgeUnknownPreservesRemainderAndBlocksOtherDebt(t *testing.T) {
+	t.Parallel()
+	e, broker, limit, updates := newHedgeRetryTest(t, 3, 1)
+	broker.place = func(OrderRequest, int) (string, error) {
+		return "", NotPlaced(errors.New("unavailable"))
+	}
+	for _, lots := range []int{10, 5} {
+		if err := e.placeHedge(context.Background(), hedgeRetryRequest(lots)); err == nil {
+			t.Fatal("initial rejection did not queue hedge debt")
+		}
+	}
+	broker.requests = nil
+	limit.classes = nil
+	broker.place = func(_ OrderRequest, call int) (string, error) {
+		switch call {
+		case 3:
+			return "accepted-four", nil
+		case 4:
+			return "", OrderUnknown("ambiguous-four", context.DeadlineExceeded)
+		default:
+			return "", NotPlaced(errors.New("size rejected"))
+		}
+	}
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err != nil {
+		t.Fatal(err)
+	}
+	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4, 4})
+	debts := e.hedges.All()
+	if len(debts) != 2 || debts[0].Request != hedgeRetryRequest(5) || debts[1].Request != hedgeRetryRequest(2) {
+		t.Fatalf("ambiguous chunk duplicated or lost debt: %+v", debts)
+	}
+	unknown := e.hedges.UnknownOrders()
+	if updates.lots != -8 || len(unknown) != 1 || unknown[0].Request != hedgeRetryRequest(4) || !unknown[0].Counted {
+		t.Fatalf("ambiguous volume was not credited exactly once: lots=%d unknown=%+v", updates.lots, unknown)
+	}
+	if err := e.OnOrderStatus(context.Background(), "accepted-four", OrderStatus{Done: true, Filled: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.requests) != 4 || updates.lots != -8 || len(e.hedges.All()) != 2 {
+		t.Fatalf("later recovery crossed unknown barrier: requests=%v lots=%d debts=%+v", broker.requests, updates.lots, e.hedges.All())
+	}
+}
+
+func TestQueuedHedgeBudgetDenialPreservesRemainderAndOtherDebt(t *testing.T) {
+	t.Parallel()
+	e, broker, limit, updates := newHedgeRetryTest(t, 3, 1)
+	broker.place = func(OrderRequest, int) (string, error) {
+		return "", NotPlaced(errors.New("unavailable"))
+	}
+	for _, lots := range []int{10, 5} {
+		if err := e.placeHedge(context.Background(), hedgeRetryRequest(lots)); err == nil {
+			t.Fatal("initial rejection did not queue hedge debt")
+		}
+	}
+	broker.requests = nil
+	limit.classes = nil
+	limit.left = 3
+	broker.place = func(_ OrderRequest, call int) (string, error) {
+		if call == 3 {
+			return "accepted-four", nil
+		}
+		return "", NotPlaced(errors.New("size rejected"))
+	}
+	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err == nil {
+		t.Fatal("recovery budget denial returned no error")
+	}
+	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4})
+	debts := e.hedges.All()
+	if len(debts) != 2 || debts[0].Request != hedgeRetryRequest(5) || debts[1].Request != hedgeRetryRequest(6) || updates.lots != -4 {
+		t.Fatalf("budget denial duplicated or lost debt: lots=%d debts=%+v", updates.lots, debts)
+	}
+	if e.Code() != StateStopped || len(limit.classes) != 4 || limit.left != 0 {
+		t.Fatalf("state=%s budget checks=%d remaining=%d", e.Code(), len(limit.classes), limit.left)
+	}
+}
+
 func TestHedgeUnknownInterruptsLadderAndPreservesOtherLots(t *testing.T) {
 	t.Parallel()
 	e, broker, limit, updates := newHedgeRetryTest(t, 3, 3)

@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/FinamWeb/finam-trade-api/go/grpc/tradeapi/v1/orders"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"QuantCore/strategies/execengine2"
 	"QuantCore/trade/finam"
@@ -111,8 +113,9 @@ type Gateway struct {
 }
 
 type placementWindow struct {
-	request  execengine2.OrderRequest
-	deadline time.Time
+	request    execengine2.OrderRequest
+	deadline   time.Time
+	lookupOnly bool
 }
 
 // NewGateway создаёт Broker для Finam. limit должен быть тем же объектом,
@@ -165,9 +168,12 @@ func (g *Gateway) Place(
 		return "", execengine2.NotPlaced(err)
 	}
 	deadline := placementRetryDeadline(g.timeNow())
-	orderID, err := g.placeWithClientID(ctx, req, clientID, deadline)
+	orderID, lookupOnly, err := g.placeWithClientID(ctx, req, clientID, deadline)
 	if err != nil && execengine2.OrderMayExist(err) {
 		g.rememberPlacement(clientID, req, deadline)
+		if lookupOnly {
+			g.stopPlacementResends(clientID)
+		}
 	}
 	return orderID, err
 }
@@ -175,6 +181,7 @@ func (g *Gateway) Place(
 // ResumePlacement resolves a previous ambiguous placement without minting another ID.
 // Looking it up is free; every resend consumes the mandatory recovery budget.
 // Each call makes at most one resend without waiting; Engine.OnTick paces recovery.
+// AlreadyExists disables further resends but leaves the placement unresolved.
 func (g *Gateway) ResumePlacement(
 	ctx context.Context,
 	req execengine2.OrderRequest,
@@ -214,11 +221,17 @@ func (g *Gateway) ResumePlacement(
 		g.forgetPlacement(clientID)
 		return "", execengine2.OrderUnknown(clientID, errors.Join(err, errors.New("client ID resend window is unknown or expired")))
 	}
+	if pending.lookupOnly {
+		return "", execengine2.OrderUnknown(clientID, errors.Join(err, errors.New("client ID already exists; placement requires lookup or reconciliation")))
+	}
 	if g.limit == nil || !g.limit.Take(1, execengine2.LimitMust) {
 		return "", execengine2.OrderUnknown(clientID, errors.Join(err, errors.New("send limit blocked retry")))
 	}
 	order, placeErr := g.api.Place(ctx, req, clientID)
 	if placeErr != nil {
+		if status.Code(placeErr) == codes.AlreadyExists {
+			g.stopPlacementResends(clientID)
+		}
 		// Even a definitive rejection here cannot disprove the original delivery.
 		return "", execengine2.OrderUnknown(clientID, errors.Join(err, placeErr, ctx.Err()))
 	}
@@ -278,27 +291,36 @@ func (g *Gateway) forgetPlacement(clientID string) {
 	delete(g.placements, clientID)
 }
 
+func (g *Gateway) stopPlacementResends(clientID string) {
+	g.placementMu.Lock()
+	defer g.placementMu.Unlock()
+	if pending, known := g.placements[clientID]; known {
+		pending.lookupOnly = true
+		g.placements[clientID] = pending
+	}
+}
+
 func (g *Gateway) placeWithClientID(
 	ctx context.Context,
 	req execengine2.OrderRequest,
 	clientID string,
 	deadline time.Time,
-) (string, error) {
+) (orderID string, lookupOnly bool, err error) {
 	var sendErr error
 	limitKind := retryKind(req)
 	for round := 0; round < sendTries; round++ {
 		if err := ctx.Err(); err != nil {
 			if sendErr == nil {
-				return "", execengine2.NotPlaced(err)
+				return "", lookupOnly, execengine2.NotPlaced(err)
 			}
-			return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, err))
+			return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, err))
 		}
 		if round > 0 {
 			if !g.timeNow().Before(deadline) {
-				return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, errors.New("client ID resend window expired")))
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, errors.New("client ID resend window expired")))
 			}
 			if g.limit == nil || !g.limit.Take(1, limitKind) {
-				return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, errors.New("send limit blocked retry")))
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, errors.New("send limit blocked retry")))
 			}
 		}
 		order, placeErr := g.api.Place(ctx, req, clientID)
@@ -306,24 +328,25 @@ func (g *Gateway) placeWithClientID(
 			if !sameOrder(order, req) {
 				err := errors.New("successful placement response does not match request")
 				g.critical("client id %s returned a mismatched placement response", clientID)
-				return "", execengine2.OrderUnknown(clientID, err)
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, err)
 			}
-			return order.id, nil
+			return order.id, lookupOnly, nil
 		}
 		if !ambiguous(placeErr) {
 			if sendErr != nil {
 				// A later rejection cannot disprove delivery of an earlier attempt.
-				return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, placeErr))
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, placeErr))
 			}
-			return "", execengine2.NotPlaced(placeErr)
+			return "", lookupOnly, execengine2.NotPlaced(placeErr)
 		}
 		sendErr = errors.Join(sendErr, placeErr)
+		lookupOnly = status.Code(placeErr) == codes.AlreadyExists
 		for range findTries {
 			if waitErr := g.waiter.Wait(ctx, findWait); waitErr != nil {
-				return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, waitErr))
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, waitErr))
 			}
 			if err := ctx.Err(); err != nil {
-				return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, err))
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, err))
 			}
 			order, found, findErr := g.api.Find(ctx, clientID)
 			if findErr != nil {
@@ -337,15 +360,20 @@ func (g *Gateway) placeWithClientID(
 				continue
 			}
 			g.logf("client id %s resolved to broker order %s", clientID, order.id)
-			return order.id, nil
+			return order.id, lookupOnly, nil
+		}
+		if lookupOnly {
+			// The ID is occupied, possibly by an already terminal order absent from
+			// the active list. Another send cannot help and must not spend budget.
+			return "", lookupOnly, execengine2.OrderUnknown(clientID, sendErr)
 		}
 		if round < sendTries-1 {
 			if waitErr := g.waiter.Wait(ctx, findWait); waitErr != nil {
-				return "", execengine2.OrderUnknown(clientID, errors.Join(sendErr, waitErr))
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, waitErr))
 			}
 		}
 	}
-	return "", execengine2.OrderUnknown(clientID, sendErr)
+	return "", lookupOnly, execengine2.OrderUnknown(clientID, sendErr)
 }
 
 func retryKind(req execengine2.OrderRequest) execengine2.LimitKind {

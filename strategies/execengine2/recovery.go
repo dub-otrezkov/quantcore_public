@@ -91,7 +91,7 @@ func (e *Engine) resumeUnknown(ctx context.Context, now time.Time) error {
 	var result error
 	// The existing retry schedule also paces diagnostics for orders that cannot
 	// be resumed, so their reconciliation barrier has an operational explanation.
-	for _, pending := range e.hedges.UnknownDue(now, e.config.RetryWait) {
+	for _, pending := range e.hedges.UnknownDue(now, e.config.RetryWait, e.config.RetryMax) {
 		if !canResume {
 			e.logger.Warnf("broker cannot resume placements: %s on %s stays behind the reconciliation barrier",
 				pending.ClientID, pending.Request.Symbol)

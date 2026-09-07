@@ -73,7 +73,8 @@ func TestUnavailableRecoveryWarningsFollowRetrySchedule(t *testing.T) {
 				{999 * time.Millisecond, 0},
 				{time.Second, 1},
 				{1001 * time.Millisecond, 1},
-				{2 * time.Second, 2},
+				{2 * time.Second, 1},
+				{3 * time.Second, 2},
 			} {
 				f.clock.now = f.now.Add(tick.after)
 				if err := engine.OnTick(context.Background(), f.clock.now); err != nil {
@@ -94,7 +95,7 @@ func TestUnavailableRecoveryWarningsFollowRetrySchedule(t *testing.T) {
 			if err := engine.Stop(context.Background(), "manual"); err != nil {
 				t.Fatal(err)
 			}
-			if err := engine.OnTick(context.Background(), f.now.Add(3*time.Second)); err != nil {
+			if err := engine.OnTick(context.Background(), f.now.Add(7*time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			if len(log.warnings) != 2 {

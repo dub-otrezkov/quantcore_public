@@ -751,29 +751,16 @@ func (e *Engine) fixWork(ctx context.Context, now time.Time) error {
 		}
 	}
 	for _, debt := range e.hedges.All() {
-		if !e.limit.Take(1, model.LimitMust) {
-			e.halt("placement budget rejected a recovery hedge")
-			return errors.Join(result, errors.New("placement budget rejected a recovery hedge"))
+		if e.hedges.UnknownCount() > 0 || e.state.Info().Code == run.Stopped {
+			break
 		}
-		orderID, err := e.broker.Place(ctx, debt.Request)
-		if err != nil {
-			if OrderMayExist(err) {
-				e.hedges.Done(debt.ID)
-				e.rememberUnknown(debt.Request, err, true)
-				clientID, _ := ErrorClientID(err)
-				e.acceptUntrackedMarket(debt.Request, clientID, "recovery hedge placement outcome is unknown")
-				e.logger.Criticalf("recovery hedge became ambiguous: %v", err)
-			} else {
-				e.hedges.Fail(debt.ID, err)
-			}
-			result = errors.Join(result, err)
-			continue
-		}
-		if err := e.addOrder(orderID, debt.Request); err != nil {
-			return errors.Join(result, err)
-		}
+		// Transfer ownership to placeHedge: its shrinking ladder records only
+		// the unplaced remainder, including after ambiguity or budget denial.
 		e.hedges.Done(debt.ID)
-		didWork = true
+		pending := e.hedges.MarketCount()
+		err := e.placeHedge(ctx, debt.Request)
+		result = errors.Join(result, err)
+		didWork = didWork || err == nil || e.hedges.MarketCount() > pending
 	}
 	remaining := len(e.orders.OrdersToClose()) + len(e.hedges.All()) + e.hedges.MarketCount() + e.hedges.UnknownCount()
 	e.state.FixDone(
