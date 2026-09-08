@@ -13,7 +13,8 @@ type market struct {
 	orderID   string
 	order     model.OrderRequest
 	sentAt    time.Time
-	lastCheck time.Time
+	nextCheck time.Time
+	checkWait time.Duration
 }
 
 // Check — запрос состояния рыночной заявки.
@@ -33,14 +34,12 @@ type CheckResult struct {
 type Work struct {
 	ID      uint64
 	Request model.OrderRequest
-	Tries   int
 	LastErr string
 }
 
 type workItem struct {
 	id      uint64
 	order   model.OrderRequest
-	tries   int
 	lastErr string
 }
 
@@ -87,8 +86,14 @@ func (m *List) SeeFill(orderID string, filled int) bool {
 	return true
 }
 
-// Checks возвращает рыночные заявки, которые пора проверить.
-func (m *List) Checks(now time.Time, wait, every time.Duration) []Check {
+// Checks returns due market orders and backs off each unresolved order. Pending
+// responses and partial fills keep that schedule; a terminal status or full fill
+// removes it. A delayed event loop schedules from now, without catch-up bursts.
+func (m *List) Checks(now time.Time, wait, firstEvery, maxEvery time.Duration) []Check {
+	if firstEvery <= 0 {
+		firstEvery = time.Second
+	}
+	maxEvery = max(firstEvery, maxEvery)
 	ids := make([]string, 0, len(m.market))
 	for id := range m.market {
 		ids = append(ids, id)
@@ -98,10 +103,18 @@ func (m *List) Checks(now time.Time, wait, every time.Duration) []Check {
 	for _, id := range ids {
 		p := m.market[id]
 		if now.Sub(p.sentAt) < wait ||
-			(!p.lastCheck.IsZero() && now.Sub(p.lastCheck) < every) {
+			(!p.nextCheck.IsZero() && now.Before(p.nextCheck)) {
 			continue
 		}
-		p.lastCheck = now
+		if p.checkWait < firstEvery {
+			p.checkWait = firstEvery
+		} else if p.checkWait > maxEvery/2 {
+			// Clamp before multiplying, including very large configured caps.
+			p.checkWait = maxEvery
+		} else {
+			p.checkWait *= 2
+		}
+		p.nextCheck = now.Add(p.checkWait)
 		checks = append(checks, Check{OrderID: id, Request: p.order})
 	}
 	return checks
@@ -130,7 +143,7 @@ func (m *List) SetStatus(orderID string, status model.OrderStatus) CheckResult {
 func (m *List) Add(req model.OrderRequest, err error) uint64 {
 	m.init()
 	m.nextID++
-	d := &workItem{id: m.nextID, order: req, tries: 1}
+	d := &workItem{id: m.nextID, order: req}
 	if err != nil {
 		d.lastErr = err.Error()
 	}
@@ -148,7 +161,7 @@ func (m *List) All() []Work {
 	result := make([]Work, 0, len(ids))
 	for _, id := range ids {
 		d := m.work[id]
-		result = append(result, Work{ID: d.id, Request: d.order, Tries: d.tries, LastErr: d.lastErr})
+		result = append(result, Work{ID: d.id, Request: d.order, LastErr: d.lastErr})
 	}
 	return result
 }
@@ -159,19 +172,6 @@ func (m *List) Done(id uint64) bool {
 		return false
 	}
 	delete(m.work, id)
-	return true
-}
-
-// Fail отмечает ещё одну неудачную попытку.
-func (m *List) Fail(id uint64, err error) bool {
-	d := m.work[id]
-	if d == nil {
-		return false
-	}
-	d.tries++
-	if err != nil {
-		d.lastErr = err.Error()
-	}
 	return true
 }
 

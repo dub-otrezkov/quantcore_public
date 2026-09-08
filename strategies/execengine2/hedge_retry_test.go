@@ -250,7 +250,7 @@ func TestQueuedHedgeShrinkRequeuesOnlyUnplacedRemainder(t *testing.T) {
 	}
 }
 
-func TestQueuedHedgeUnknownPreservesRemainderAndBlocksOtherDebt(t *testing.T) {
+func TestQueuedHedgeUnknownDoesNotParkUnplacedDebt(t *testing.T) {
 	t.Parallel()
 	e, broker, limit, updates := newHedgeRetryTest(t, 3, 1)
 	broker.place = func(OrderRequest, int) (string, error) {
@@ -270,19 +270,22 @@ func TestQueuedHedgeUnknownPreservesRemainderAndBlocksOtherDebt(t *testing.T) {
 		case 4:
 			return "", OrderUnknown("ambiguous-four", context.DeadlineExceeded)
 		default:
+			if call > 4 {
+				return fmt.Sprintf("healthy-%d", call), nil
+			}
 			return "", NotPlaced(errors.New("size rejected"))
 		}
 	}
 	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err != nil {
 		t.Fatal(err)
 	}
-	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4, 4})
+	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4, 4, 5})
 	debts := e.hedges.All()
-	if len(debts) != 2 || debts[0].Request != hedgeRetryRequest(5) || debts[1].Request != hedgeRetryRequest(2) {
+	if len(debts) != 1 || debts[0].Request != hedgeRetryRequest(2) {
 		t.Fatalf("ambiguous chunk duplicated or lost debt: %+v", debts)
 	}
 	unknown := e.hedges.UnknownOrders()
-	if updates.lots != -8 || len(unknown) != 1 || unknown[0].Request != hedgeRetryRequest(4) || !unknown[0].Counted {
+	if updates.lots != -13 || len(unknown) != 1 || unknown[0].Request != hedgeRetryRequest(4) || !unknown[0].Counted {
 		t.Fatalf("ambiguous volume was not credited exactly once: lots=%d unknown=%+v", updates.lots, unknown)
 	}
 	if err := e.OnOrderStatus(context.Background(), "accepted-four", OrderStatus{Done: true, Filled: 4}); err != nil {
@@ -291,8 +294,9 @@ func TestQueuedHedgeUnknownPreservesRemainderAndBlocksOtherDebt(t *testing.T) {
 	if err := e.OnTick(context.Background(), e.state.Info().NextTry); err != nil {
 		t.Fatal(err)
 	}
-	if len(broker.requests) != 4 || updates.lots != -8 || len(e.hedges.All()) != 2 {
-		t.Fatalf("later recovery crossed unknown barrier: requests=%v lots=%d debts=%+v", broker.requests, updates.lots, e.hedges.All())
+	checkHedgeRetryAttempts(t, broker, limit, []int{10, 7, 4, 4, 5, 2})
+	if updates.lots != -15 || len(e.hedges.All()) != 0 || e.Info().UnknownOrders != 1 {
+		t.Fatalf("unplaced remainder was not recovered independently: lots=%d debts=%+v unknown=%d", updates.lots, e.hedges.All(), e.Info().UnknownOrders)
 	}
 }
 
@@ -350,8 +354,8 @@ func TestHedgeUnknownInterruptsLadderAndPreservesOtherLots(t *testing.T) {
 	if len(debts) != 1 || debts[0].Request != hedgeRetryRequest(2) || updates.lots != -8 {
 		t.Fatalf("accepted and ambiguous lots=%d debts=%+v", updates.lots, debts)
 	}
-	if e.Code() != StateCheckNeeded || e.hedges.MarketCount() != 1 {
-		t.Fatalf("state=%s pending=%d", e.Code(), e.hedges.MarketCount())
+	if e.Code() != StateFixing || e.state.Info().NextTry.IsZero() || e.hedges.MarketCount() != 1 || e.Info().UnknownOrders != 1 {
+		t.Fatalf("remainder not scheduled behind unresolved chunk: state=%+v pending=%d unknown=%d", e.state.Info(), e.hedges.MarketCount(), e.Info().UnknownOrders)
 	}
 }
 

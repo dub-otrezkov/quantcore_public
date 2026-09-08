@@ -604,6 +604,7 @@ func (e *Engine) placeHedge(ctx context.Context, req model.OrderRequest) error {
 			if remaining > 0 {
 				req.Lots = remaining
 				e.hedges.Add(req, err)
+				e.state.StartFix(e.clock.Now(), e.config.RetryWait, "unplaced hedge remainder after ambiguous placement")
 			}
 			return nil
 		}
@@ -722,7 +723,7 @@ func (e *Engine) useMarketStatus(_ context.Context, orderID string, status model
 }
 
 func (e *Engine) checkMarketOrders(ctx context.Context, now time.Time) error {
-	checks := e.hedges.Checks(now, e.config.MarketCheckAfter, e.config.MarketCheckEvery)
+	checks := e.hedges.Checks(now, e.config.MarketCheckAfter, e.config.MarketCheckEvery, e.config.RetryMax)
 	var result error
 	for _, check := range checks {
 		status, err := e.broker.Status(ctx, check.OrderID)
@@ -751,11 +752,13 @@ func (e *Engine) fixWork(ctx context.Context, now time.Time) error {
 		}
 	}
 	for _, debt := range e.hedges.All() {
-		if e.hedges.UnknownCount() > 0 || e.state.Info().Code == run.Stopped {
+		if e.state.Info().Code == run.Stopped {
 			break
 		}
 		// Transfer ownership to placeHedge: its shrinking ladder records only
 		// the unplaced remainder, including after ambiguity or budget denial.
+		// These lots exclude accepted/unknown chunks and remain safe to send;
+		// hedgeTrade still blocks inferring a new obligation from unknown fills.
 		e.hedges.Done(debt.ID)
 		pending := e.hedges.MarketCount()
 		err := e.placeHedge(ctx, debt.Request)
