@@ -143,6 +143,14 @@ func (r *List) Close(orderID string, filledNow int) Change {
 		return Change{}
 	}
 	filledNow = min(max(filledNow, 0), o.req.Lots)
+	if o.done {
+		// The first terminal count is already settled. Replays cannot retract
+		// it or mint inventory; subsequent fill events still record real lots.
+		return Change{
+			Known: true, Conflict: filledNow != o.endFilled || o.filled > filledNow,
+			FillPrice: o.guessPrice, Order: snapshot(o),
+		}
+	}
 	o.done = true
 	o.endFilled = filledNow
 	final := max(filledNow, o.filled)
@@ -177,6 +185,12 @@ func (r *List) OrdersToClose() []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// Closing reports whether a failed retirement already belongs to the retry loop.
+func (r *List) Closing(orderID string) bool {
+	_, ok := r.closeList[orderID]
+	return ok
 }
 
 // HasOrder проверяет, знает ли список эту заявку.

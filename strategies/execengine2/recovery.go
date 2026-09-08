@@ -78,7 +78,7 @@ func (e *Engine) confirmUnknownPositions(actualA, actualB int) {
 		}
 		e.hedges.ResolveUnknown(unknown.ID)
 	}
-	e.finishTrade(e.clock.Now(), false)
+	e.finishTrade(e.clock.Now())
 }
 
 // resumeUnknown only resumes the original idempotent placement. In particular,
@@ -111,11 +111,11 @@ func (e *Engine) resumeUnknown(ctx context.Context, now time.Time) error {
 		// credit inventory or the clip a second time.
 		change, err := e.orders.Add(orderID, pending.Request, now, pending.Request.Price, true)
 		if err != nil {
-			e.halt("resumed market order has an unusable id: " + err.Error())
+			_ = e.halt(ctx, "resumed market order has an unusable id: "+err.Error())
 			return errors.Join(result, err)
 		}
 		if err := e.hedges.AddMarket(orderID, pending.Request, now); err != nil {
-			e.halt("resumed market order could not be tracked: " + err.Error())
+			_ = e.halt(ctx, "resumed market order could not be tracked: "+err.Error())
 			return errors.Join(result, err)
 		}
 		if !pending.Counted {

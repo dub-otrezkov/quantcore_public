@@ -261,14 +261,18 @@ func (v2HarnessEngine) Build(
 	stop <-chan struct{},
 ) (harnessEngine, func(int, time.Time)) {
 	t.Helper()
-	limit, reserve := int64(1_000_000), int64(0)
+	limit, reserve := 1_000_000, 0
 	if cfg.limiterQuota > 0 {
-		limit, reserve = execengine.DefaultPlaceOrderBudget, int64(cfg.limiterQuota)
+		limit, reserve = execengine.DefaultPlaceOrderBudget, cfg.limiterQuota
 	}
 	if cfg.limiterBudget > 0 {
-		limit = int64(cfg.limiterBudget)
+		limit = cfg.limiterBudget
 	}
-	sendBudget, err := budget.New(limit, reserve)
+	window := cfg.limiterWindow
+	if window <= 0 {
+		window = execengine.DefaultQuotaWindow
+	}
+	sendBudget, err := budget.NewQuota(limit, reserve, window)
 	if err != nil {
 		t.Fatalf("execengine2 budget: %v", err)
 	}
@@ -279,11 +283,17 @@ func (v2HarnessEngine) Build(
 	mode := execengine2.ModeTwoLimits
 	if cfg.ec.TakerOnly {
 		mode = execengine2.ModeMarket
+	} else if cfg.ec.SoloMakerLeg {
+		mode = execengine2.ModeLimitA
 	}
 	engine, err := execengine2.NewEngine(execengine2.Config{
 		LegA: cfg.ec.LegA, LegB: cfg.ec.LegB, Lots: cfg.ec.OrderVol, Mode: mode,
 		BookMaxAge: cfg.ec.MaxStaleness, PriceWait: cfg.ec.RepegThrottle, MinRest: cfg.ec.MinRest,
 		TradeTimeout: cfg.ec.FillTimeout, RetryWait: cfg.ec.PlaceRetryBackoff,
+		Ratio: cfg.ec.HedgeRatio, ForceCloseOnTimeout: cfg.ec.ForceCloseOnTimeout,
+		KeepPartialOpenOnTimeout: cfg.ec.KeepPartialOpenOnTimeout,
+		DisableRepeg:             cfg.ec.DisableRepeg, PullOnStaleBook: cfg.ec.PullOnStaleBook,
+		RejectRetryLotStep: cfg.ec.RejectRetryLotStep, RejectRetryMinLots: cfg.ec.RejectRetryMinLots,
 		MarketCheckAfter: 2 * time.Second, MarketCheckEvery: 300 * time.Millisecond,
 		HedgeTries: cfg.ec.HedgeRetries, LogTag: cfg.ec.LogTag,
 	}, execengine2.Setup{
@@ -294,18 +304,16 @@ func (v2HarnessEngine) Build(
 	if err != nil {
 		t.Fatalf("execengine2.NewEngine: %v", err)
 	}
-	if cfg.limiterBudget > 0 && cfg.limiterWindow > 0 {
-		controller, controllerErr := budget.NewController(sendBudget, int64(cfg.limiterBudget), cfg.limiterWindow)
-		if controllerErr != nil {
-			t.Fatalf("execengine2 budget controller: %v", controllerErr)
-		}
+	if cfg.refreshQuota {
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() { <-stop; cancel() }()
-		go controller.Run(ctx)
+		go finambroker.RefreshQuota(ctx, client, sendBudget)
 	}
 	var setQuota func(int, time.Time)
 	if cfg.limiterQuota > 0 {
-		setQuota = func(remaining int, _ time.Time) { sendBudget.Reset(int64(remaining)) }
+		setQuota = func(remaining int, resetAt time.Time) {
+			sendBudget.Set(remaining, resetAt, time.Now(), sendBudget.Snapshot())
+		}
 	}
 	return &v2EngineAdapter{engine: engine}, setQuota
 }

@@ -29,27 +29,39 @@ type pair struct {
 	legB         legData
 	first        model.Leg
 	stopping     bool
+	settlement   Settlement
 	endAt        time.Time
 	basePosition int
 }
 
+// Settlement survives deferred cancels: a retry must keep the original intent.
+type Settlement uint8
+
+const (
+	Drop     Settlement = iota // equalize realized fills, without booking a lot
+	Resolve                    // complete and book if cancellation catches any fill
+	Complete                   // complete and book even an entirely unfilled close
+)
+
 // Info — копия текущей сделки для чтения.
 type Info struct {
-	ID           uint64
-	Plan         model.Plan
-	Mode         model.Mode
-	LotsA        int
-	Ratio        int
-	First        model.Leg
-	FilledA      int
-	FilledB      int
-	OrderA       string
-	OrderB       string
-	OpenA        bool
-	OpenB        bool
-	Stopping     bool
-	EndAt        time.Time
-	BasePosition int
+	ID            uint64
+	Plan          model.Plan
+	Mode          model.Mode
+	LotsA         int
+	Ratio         int
+	First         model.Leg
+	FilledA       int
+	FilledB       int
+	OrderA        string
+	OrderB        string
+	OpenA         bool
+	OpenB         bool
+	Stopping      bool
+	Settlement    Settlement
+	LastPlacement time.Time
+	EndAt         time.Time
+	BasePosition  int
 }
 
 // FillResult описывает итог исполнения лимитной заявки.
@@ -281,31 +293,32 @@ func (m *Trade) Hedge(role model.OrderRole) (model.OrderRequest, bool, error) {
 	if c == nil {
 		return model.OrderRequest{}, false, nil
 	}
-	wantB := c.legA.filled * c.ratio
-	if c.legB.filled < wantB {
-		req := c.legB.req
-		req.Kind = model.OrderMarket
-		req.Role = role
-		req.Lots = wantB - c.legB.filled
-		return req, true, nil
-	}
-	if c.legB.filled == wantB {
+	settling := c.stopping && role != model.RoleLateFill
+	if settling && (c.legA.open || c.legB.open) {
 		return model.OrderRequest{}, false, nil
 	}
-	if c.legB.filled%c.ratio != 0 {
-		return model.OrderRequest{}, false, fmt.Errorf(
-			"leg B execution %d is not divisible by hedge ratio %d", c.legB.filled, c.ratio,
-		)
+	want := c.legA.filled
+	if c.legB.filled > want*c.ratio {
+		if c.legB.filled%c.ratio != 0 {
+			return model.OrderRequest{}, false, fmt.Errorf("leg B execution %d is not divisible by hedge ratio %d", c.legB.filled, c.ratio)
+		}
+		want = c.legB.filled / c.ratio
 	}
-	wantA := c.legB.filled / c.ratio
-	if c.legA.filled >= wantA {
-		return model.OrderRequest{}, false, nil
+	if settling && (c.settlement == Complete || c.settlement == Resolve && want > 0) {
+		want = max(want, c.lotsA)
 	}
-	req := c.legA.req
-	req.Kind = model.OrderMarket
-	req.Role = role
-	req.Lots = wantA - c.legA.filled
-	return req, true, nil
+	for _, leg := range []*legData{&c.legA, &c.legB} {
+		target := want
+		if leg == &c.legB {
+			target *= c.ratio
+		}
+		if leg.filled < target {
+			req := leg.req
+			req.Kind, req.Role, req.Lots = model.OrderMarket, role, target-leg.filled
+			return req, true, nil
+		}
+	}
+	return model.OrderRequest{}, false, nil
 }
 
 // IsPaired проверяет нужное отношение объёмов пары.
@@ -321,12 +334,15 @@ func (m *Trade) Full() bool {
 }
 
 // Stop начинает остановку и возвращает открытые лимитные заявки.
-func (m *Trade) Stop() []string {
+func (m *Trade) Stop(policy Settlement) []string {
 	c := m.current
 	if c == nil {
 		return nil
 	}
-	c.stopping = true
+	if !c.stopping {
+		c.stopping = true
+		c.settlement = policy
+	}
 	ids := make([]string, 0, 2)
 	if c.legA.open {
 		ids = append(ids, c.legA.orderID)
@@ -343,6 +359,9 @@ func (m *Trade) Finish(allowPartial bool) (model.Plan, bool) {
 	if c == nil || !m.IsPaired() || c.legA.filled == 0 {
 		return model.Plan{}, false
 	}
+	if c.stopping && (c.legA.open || c.legB.open || c.settlement == Drop) {
+		return model.Plan{}, false
+	}
 	if !allowPartial && c.legA.filled < c.lotsA {
 		return model.Plan{}, false
 	}
@@ -350,6 +369,29 @@ func (m *Trade) Finish(allowPartial bool) (model.Plan, bool) {
 	plan.Lots = c.legA.filled
 	m.current = nil
 	return plan, true
+}
+
+// FinishMarket books the worked intent, including explicitly queued debts.
+// The caller must have a definite outcome for both initial market placements.
+func (m *Trade) FinishMarket() (model.Plan, bool) {
+	c := m.current
+	if c == nil || c.mode != model.ModeMarket {
+		return model.Plan{}, false
+	}
+	plan := c.plan
+	plan.Lots = c.lotsA
+	m.current = nil
+	return plan, true
+}
+
+// DropSettled removes an explicitly abandoned pair only after every maker retires.
+func (m *Trade) DropSettled() bool {
+	c := m.current
+	if c == nil || !c.stopping || c.settlement != Drop || c.legA.open || c.legB.open || !m.IsPaired() {
+		return false
+	}
+	m.current = nil
+	return true
 }
 
 // DropEmpty убирает пустую сделку без заявок и исполнений.
@@ -385,7 +427,9 @@ func (m *Trade) NewPrice(
 		return PriceOrder{}, false
 	}
 	price := touch.Price(ls.req.Side)
-	if price <= 0 || price == ls.req.Price || now.Sub(ls.sentAt) < minRest ||
+	behind := ls.req.Side == model.SideBuy && price > ls.req.Price ||
+		ls.req.Side == model.SideSell && price < ls.req.Price
+	if price <= 0 || !behind || now.Sub(ls.sentAt) < minRest ||
 		(!ls.lastPrice.IsZero() && now.Sub(ls.lastPrice) < wait) {
 		return PriceOrder{}, false
 	}
@@ -427,8 +471,15 @@ func (m *Trade) Info() (Info, bool) {
 		First: c.first, FilledA: c.legA.filled, FilledB: c.legB.filled,
 		OrderA: c.legA.orderID, OrderB: c.legB.orderID,
 		OpenA: c.legA.open, OpenB: c.legB.open,
-		Stopping: c.stopping, EndAt: c.endAt, BasePosition: c.basePosition,
+		Stopping: c.stopping, Settlement: c.settlement, LastPlacement: maxTime(c.legA.sentAt, c.legB.sentAt), EndAt: c.endAt, BasePosition: c.basePosition,
 	}, true
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 func getLeg(c *pair, leg model.Leg) *legData {

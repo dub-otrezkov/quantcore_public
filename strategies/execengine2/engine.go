@@ -46,6 +46,7 @@ type Engine struct {
 	state  *run.State
 
 	reusedIDBarrier bool
+	now             time.Time // monotonic event time; processing time belongs to the send limit
 }
 
 // Info — короткий снимок состояния движка.
@@ -102,6 +103,7 @@ func (e *Engine) OnBook(
 	if ctx == nil {
 		return errors.New("nil context")
 	}
+	e.advanceNow(at)
 	if !e.quotes.Update(symbol, at, bestBid, bestAsk) {
 		return nil
 	}
@@ -110,8 +112,11 @@ func (e *Engine) OnBook(
 		return nil
 	}
 	staleA, staleB := e.quotes.TooOld(at, e.config.BookMaxAge)
-	if staleA || staleB {
-		return e.stopTrade(ctx, "invalid or stale order book", true)
+	if e.config.PullOnStaleBook && (staleA || staleB) {
+		return e.resolveTrade(ctx, "invalid or stale order book")
+	}
+	if e.config.DisableRepeg || e.state.Info().Code == run.Stopped {
+		return nil
 	}
 	leg := model.LegA
 	if symbol == e.config.LegB {
@@ -123,7 +128,14 @@ func (e *Engine) OnBook(
 	if !ok {
 		return nil
 	}
-	if !e.limit.Take(1, model.LimitNormal) {
+	gate, checkOnly := e.limit.(interface{ Allow(int64) bool })
+	allowed := false
+	if checkOnly {
+		allowed = gate.Allow(1)
+	} else {
+		allowed = e.limit.Take(1, model.LimitNormal)
+	}
+	if !allowed {
 		e.logger.Warnf("repeg of %s denied by placement budget", symbol)
 		return nil
 	}
@@ -133,23 +145,26 @@ func (e *Engine) OnBook(
 		return fmt.Errorf("retiring %s for repeg: %w", next.OldOrderID, err)
 	}
 	if change.Lots != 0 {
-		if err := e.useLimitFill(ctx, change, true); err != nil {
-			return err
-		}
-		return nil // исполнение пришло раньше отмены; дальше работает обычный путь сделки
+		e.trade.AddFill(change.Order.ID, change.Lots)
+		e.trade.Stop(trade.Complete)
+		return e.stopTrade(ctx, "repeg cancellation caught a fill", true)
 	}
 
 	orderID, err := e.broker.Place(ctx, next.Request)
+	if checkOnly {
+		e.limit.Take(1, model.LimitMust)
+	}
 	if err != nil {
 		e.placeFailed(err, "repeg placement")
+		e.quotes.BlockOpen(at.Add(e.config.RetryWait))
 		abortErr := e.stopTrade(ctx, "repeg placement failed", !OrderMayExist(err))
 		return errors.Join(fmt.Errorf("placing repeg: %w", err), abortErr)
 	}
-	if err := e.addOrder(orderID, next.Request); err != nil {
+	if err := e.addOrder(ctx, orderID, next.Request); err != nil {
 		return err
 	}
-	if err := e.trade.SetNewOrder(next, orderID, e.clock.Now()); err != nil {
-		e.halt("replacement order could not be attached to its clip: " + err.Error())
+	if err := e.trade.SetNewOrder(next, orderID, e.now); err != nil {
+		_ = e.halt(ctx, "replacement order could not be attached to its clip: "+err.Error())
 		return err
 	}
 	e.logger.Infof("repegged %s from %s to %s at %.6f", symbol, next.OldOrderID, orderID, next.Request.Price)
@@ -161,7 +176,18 @@ func (e *Engine) OnSignal(ctx context.Context, state Signal) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
-	if !e.state.CanOpen() || e.HasTrade() || e.hedges.HasWork() ||
+	e.advanceNow(state.Time)
+	if !e.state.CanOpen() {
+		return nil
+	}
+	if clip, active := e.trade.Info(); active {
+		plan := e.strategy.Peek(state)
+		if plan.Action != clip.Plan.Action || e.executionMode(plan) != clip.Mode {
+			return e.resolveTrade(ctx, "strategy intent changed")
+		}
+		return nil
+	}
+	if e.hedges.HasWork() ||
 		!e.quotes.Ready(state.Time, e.config.BookMaxAge) {
 		return nil
 	}
@@ -176,51 +202,76 @@ func (e *Engine) OnSignal(ctx context.Context, state Signal) error {
 	if lots <= 0 {
 		return errors.New("decider returned a non-positive clip size")
 	}
-	mode := plan.Mode
-	if mode == model.ModeDefault {
-		mode = e.config.Mode
-	}
+	mode := e.executionMode(plan)
 	count := orderCount(mode)
 	if count == 0 {
 		return fmt.Errorf("unsupported execution mode %d", mode)
 	}
-	if !e.limit.Take(int64(count), model.LimitNormal) {
-		e.quotes.BlockOpen(state.Time.Add(e.config.RetryWait))
-		e.logger.Warnf("clip open denied by placement budget; remaining=%d", e.limit.Remaining())
+	return e.openLimitsOrMarket(ctx, plan, mode, lots, count, state.Time)
+}
+
+func (e *Engine) openLimitsOrMarket(ctx context.Context, plan Plan, mode Mode, lots, count int, at time.Time) error {
+	// Quota-aware limits preserve v1's two-op admission and charge only actual RPCs.
+	// Custom reservation-only SendLimits retain their existing atomic Take contract.
+	gate, checkOnly := e.limit.(interface{ Allow(int64) bool })
+opening:
+	for {
+		allowed := false
+		if checkOnly {
+			allowed = gate.Allow(2)
+		} else {
+			allowed = e.limit.Take(int64(count), model.LimitNormal)
+		}
+		if !allowed {
+			delay := e.config.RetryWait
+			if quota, ok := e.limit.(interface{ RetryAfter(int64) time.Duration }); ok {
+				if wait := quota.RetryAfter(2); wait > 0 {
+					delay = wait
+				}
+			}
+			e.quotes.BlockOpen(at.Add(delay))
+			e.logger.Warnf("clip open denied by placement budget; remaining=%d", e.limit.Remaining())
+			return nil
+		}
+
+		requests, err := e.trade.Start(
+			plan, mode, e.config.LegA, e.config.LegB,
+			e.quotes.Prices(model.LegA), e.quotes.Prices(model.LegB),
+			lots, e.config.Ratio, at, e.config.TradeTimeout, e.strategy.Position(),
+		)
+		if err != nil {
+			return err
+		}
+		if mode == model.ModeMarket {
+			return e.openMarket(ctx, requests, at, checkOnly)
+		}
+		for i, req := range requests {
+			orderID, placeErr := e.broker.Place(ctx, req)
+			if checkOnly {
+				e.limit.Take(1, model.LimitMust)
+			}
+			if placeErr != nil {
+				e.placeFailed(placeErr, "opening placement")
+				e.quotes.BlockOpen(at.Add(e.config.RetryWait))
+				abortErr := e.stopTrade(ctx, "opening placement failed", !OrderMayExist(placeErr))
+				next := lots - e.config.RejectRetryLotStep
+				if i == 0 && plan.IsClose && !OrderMayExist(placeErr) && abortErr == nil &&
+					e.config.RejectRetryLotStep > 0 && next >= e.config.RejectRetryMinLots {
+					lots = next
+					continue opening
+				}
+				return errors.Join(fmt.Errorf("placing opening order on %s: %w", req.Symbol, placeErr), abortErr)
+			}
+			if err := e.trade.Attach(req.Leg, orderID, e.now); err != nil {
+				_ = e.halt(ctx, "placed order could not be attached to its clip: "+err.Error())
+				return err
+			}
+			if err := e.addOrder(ctx, orderID, req); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
-
-	requests, err := e.trade.Start(
-		plan, mode, e.config.LegA, e.config.LegB,
-		e.quotes.Prices(model.LegA), e.quotes.Prices(model.LegB),
-		lots, e.config.Ratio, state.Time, e.config.TradeTimeout, e.strategy.Position(),
-	)
-	if err != nil {
-		return err
-	}
-	if mode == model.ModeMarket {
-		return e.openMarket(ctx, requests, state.Time)
-	}
-	for _, req := range requests {
-		orderID, placeErr := e.broker.Place(ctx, req)
-		if placeErr != nil {
-			e.placeFailed(placeErr, "opening placement")
-			e.quotes.BlockOpen(state.Time.Add(e.config.RetryWait))
-			abortErr := e.stopTrade(ctx, "opening placement failed", !OrderMayExist(placeErr))
-			return errors.Join(fmt.Errorf("placing opening order on %s: %w", req.Symbol, placeErr), abortErr)
-		}
-		if err := e.trade.Attach(req.Leg, orderID, e.clock.Now()); err != nil {
-			e.halt("placed order could not be attached to its clip: " + err.Error())
-			return err
-		}
-		if err := e.addOrder(orderID, req); err != nil {
-			return err
-		}
-	}
-	if e.trade.Full() {
-		e.finishTrade(state.Time, false)
-	}
-	return nil
 }
 
 // OnFill принимает одно исполнение нашей заявки.
@@ -228,6 +279,7 @@ func (e *Engine) OnFill(ctx context.Context, fill Fill) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
+	e.advanceNow(fill.At)
 	change := e.orders.AddFill(fill)
 	if !change.Known || change.Again {
 		return nil
@@ -273,13 +325,10 @@ func (e *Engine) OnOrderStatus(ctx context.Context, orderID string, status Order
 	wasCurrent := e.trade.CloseOrder(orderID)
 	e.sendChange(change, "maker terminal status")
 	if change.Lots != 0 {
-		return e.useLimitFill(ctx, change, true)
+		e.trade.AddFill(orderID, change.Lots)
 	}
-	if wasCurrent {
-		clip, ok := e.trade.Info()
-		if ok && clip.First == model.LegNone {
-			return e.stopTrade(ctx, "resting maker became terminal before any fill", true)
-		}
+	if wasCurrent && !snap.Done {
+		return e.stopTrade(ctx, "resting maker became terminal", true)
 	}
 	return nil
 }
@@ -289,11 +338,18 @@ func (e *Engine) OnTick(ctx context.Context, now time.Time) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
+	e.advanceNow(now)
+	if e.state.Info().Code == run.Stopped {
+		if e.state.FixDue(now) {
+			return e.fixWork(ctx, now)
+		}
+		return nil
+	}
 	result := e.resumeUnknown(ctx, now)
 	if clip, active := e.trade.Info(); active && !clip.Stopping {
 		staleA, staleB := e.quotes.TooOld(now, e.config.BookMaxAge)
-		if staleA || staleB || e.trade.TooLate(now) {
-			result = errors.Join(result, e.stopTrade(ctx, "clip timeout or stale book", true))
+		if e.config.PullOnStaleBook && (staleA || staleB) || e.trade.TooLate(now) {
+			result = errors.Join(result, e.resolveTrade(ctx, "clip timeout or stale book"))
 		}
 	}
 	result = errors.Join(result, e.checkMarketOrders(ctx, now))
@@ -309,7 +365,7 @@ func (e *Engine) OnTick(ctx context.Context, now time.Time) error {
 			// Maker fills may have accumulated while an earlier hedge was unknown.
 			result = errors.Join(result, e.hedgeTrade(ctx, model.RoleHedge))
 			if e.trade.Full() {
-				e.finishTrade(now, false)
+				result = errors.Join(result, e.completeTrade(ctx))
 			}
 		}
 	}
@@ -330,8 +386,39 @@ func (e *Engine) Stop(ctx context.Context, reason string) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
-	e.halt(reason)
-	return e.stopTrade(ctx, "engine halted", false)
+	return e.halt(ctx, reason)
+}
+
+// PullIfUnwanted is the ledger-based strategy's cancel-only signal path.
+func (e *Engine) PullIfUnwanted(ctx context.Context, state Signal) error {
+	if ctx == nil {
+		return errors.New("nil context")
+	}
+	e.advanceNow(state.Time)
+	clip, active := e.trade.Info()
+	if !active || state.Time.Sub(clip.LastPlacement) < e.config.MinRest ||
+		e.strategy.Peek(state).Action == clip.Plan.Action {
+		return nil
+	}
+	return e.StopTrade(ctx)
+}
+
+func (e *Engine) advanceNow(at time.Time) {
+	if at.After(e.now) {
+		e.now = at
+	}
+}
+
+func (e *Engine) executionMode(plan Plan) Mode {
+	mode := plan.Mode
+	if mode == ModeDefault {
+		mode = e.config.Mode
+	}
+	if e.config.Ratio > 1 && (mode == ModeTwoLimits || mode == ModeLimitB) {
+		e.logger.Criticalf("mode %d cannot rest leg B at ratio %d; using leg A maker", mode, e.config.Ratio)
+		return ModeLimitA
+	}
+	return mode
 }
 
 // CheckPositions сравнивает позицию брокера с позицией стратегии.
@@ -394,7 +481,7 @@ func orderCount(mode model.Mode) int {
 	}
 }
 
-func (e *Engine) addOrder(orderID string, req model.OrderRequest) error {
+func (e *Engine) addOrder(ctx context.Context, orderID string, req model.OrderRequest) error {
 	countNow := req.Kind == model.OrderMarket
 	change, err := e.orders.Add(orderID, req, e.clock.Now(), req.Price, countNow)
 	if err != nil {
@@ -405,7 +492,7 @@ func (e *Engine) addOrder(orderID string, req model.OrderRequest) error {
 			}
 			return nil
 		}
-		e.halt("broker returned an unusable order id: " + err.Error())
+		_ = e.halt(ctx, "broker returned an unusable order id: "+err.Error())
 		return err
 	}
 	e.sendChange(change, "taker placement")
@@ -413,7 +500,7 @@ func (e *Engine) addOrder(orderID string, req model.OrderRequest) error {
 		return nil
 	}
 	if err := e.hedges.AddMarket(orderID, req, e.clock.Now()); err != nil {
-		e.halt("taker could not be tracked: " + err.Error())
+		_ = e.halt(ctx, "taker could not be tracked: "+err.Error())
 		return err
 	}
 	e.trade.AddMarket(req.TradeID, req.Leg, req.Lots)
@@ -479,14 +566,35 @@ func (e *Engine) useLimitFill(
 	if !transition.Known {
 		return e.fixLateFill(ctx, change.Order.Request, change.Lots)
 	}
+	if clip, _ := e.trade.Info(); clip.Stopping {
+		if !change.Order.Done && e.hedges.UnknownCount() == 0 && len(e.hedges.All()) == 0 {
+			// A newly proved stream execution is an independent obligation even
+			// while cancel RPCs are unavailable. Hedge only a new lead on its leg;
+			// catching up to an already known counterpart needs no extra order.
+			req, ok, err := e.trade.Hedge(model.RoleLateFill)
+			if err != nil {
+				return errors.Join(err, e.halt(ctx, err.Error()))
+			}
+			if ok && req.Leg != change.Order.Request.Leg {
+				return e.placeHedge(ctx, req)
+			}
+		}
+		return nil // retire every maker before calculating settlement from acks
+	}
 	if closeOther && transition.First && transition.CloseOrderID != "" {
 		other, err := e.closeOrder(ctx, transition.CloseOrderID)
 		if err != nil {
+			clip, _ := e.trade.Info()
+			e.trade.Stop(e.settlement(clip.Plan))
 			return err
 		}
 		if other.Lots != 0 {
-			if err := e.useLimitFill(ctx, other, false); err != nil {
-				return err
+			e.trade.AddFill(other.Order.ID, other.Lots)
+			clip, _ := e.trade.Info()
+			ahead := transition.Leg == model.LegA && clip.FilledB > clip.FilledA*clip.Ratio ||
+				transition.Leg == model.LegB && clip.FilledA*clip.Ratio > clip.FilledB
+			if ahead {
+				return e.resolveTrade(ctx, "counterpart executed ahead of first maker")
 			}
 		}
 	}
@@ -494,7 +602,7 @@ func (e *Engine) useLimitFill(
 		return err
 	}
 	if e.trade.Full() {
-		e.finishTrade(e.clock.Now(), false)
+		return e.completeTrade(ctx)
 	}
 	return nil
 }
@@ -502,7 +610,7 @@ func (e *Engine) useLimitFill(
 func (e *Engine) fixLateFill(ctx context.Context, maker model.OrderRequest, lots int) error {
 	req := model.OrderRequest{
 		Kind: model.OrderMarket, Role: model.RoleLateFill,
-		Side: maker.Side.Other(), TradeID: 0,
+		Side: maker.Side.Other(), TradeID: maker.TradeID,
 	}
 	switch maker.Leg {
 	case model.LegA:
@@ -513,7 +621,7 @@ func (e *Engine) fixLateFill(ctx context.Context, maker model.OrderRequest, lots
 	case model.LegB:
 		if lots%e.config.Ratio != 0 {
 			reason := fmt.Sprintf("stray leg B fill %d is not divisible by hedge ratio %d", lots, e.config.Ratio)
-			e.halt(reason)
+			_ = e.halt(ctx, reason)
 			return errors.New(reason)
 		}
 		req.Leg = model.LegA
@@ -534,7 +642,7 @@ func (e *Engine) hedgeTrade(ctx context.Context, role model.OrderRole) error {
 		}
 		req, ok, err := e.trade.Hedge(role)
 		if err != nil {
-			e.halt(err.Error())
+			_ = e.halt(ctx, err.Error())
 			return err
 		}
 		if !ok {
@@ -551,10 +659,17 @@ func (e *Engine) hedgeTrade(ctx context.Context, role model.OrderRole) error {
 }
 
 func (e *Engine) placeHedge(ctx context.Context, req model.OrderRequest) error {
+	return e.placeHedgeAttempts(ctx, req, e.config.HedgeTries, true)
+}
+
+func (e *Engine) placeHedgeAttempts(ctx context.Context, req model.OrderRequest, tries int, canShrink bool) error {
+	if e.state.Info().Code == run.Stopped {
+		return errors.New("engine halted")
+	}
 	remaining := req.Lots
+	_, chargeAfter := e.limit.(interface{ Allow(int64) bool })
 	size := remaining
-	shrinking := e.config.RejectRetryLotStep > 0
-	tries := e.config.HedgeTries
+	shrinking := canShrink && e.config.RejectRetryLotStep > 0 && size >= e.config.RejectRetryMinLots
 	var lastErr error
 	// The ladder terminates: each success pays at least one owed lot, and each
 	// rejection reduces size until one lot is rejected. HedgeTries then bounds
@@ -564,19 +679,23 @@ func (e *Engine) placeHedge(ctx context.Context, req model.OrderRequest) error {
 			size = remaining
 			tries--
 		}
-		if !e.limit.Take(1, model.LimitMust) {
+		if !chargeAfter && !e.limit.Take(1, model.LimitMust) {
 			reason := "placement budget rejected a mandatory hedge"
 			req.Lots = remaining
 			e.hedges.Add(req, errors.New(reason))
-			e.halt(reason)
+			_ = e.halt(ctx, reason)
 			return errors.New(reason)
 		}
 		part := req
 		part.Lots = size
+		part.Price = e.quotes.Prices(part.Leg).MarketPrice(part.Side)
 		orderID, err := e.broker.Place(ctx, part)
+		if chargeAfter {
+			e.limit.Take(1, model.LimitMust)
+		}
 		if err == nil {
 			remaining -= size
-			if err := e.addOrder(orderID, part); err != nil {
+			if err := e.addOrder(ctx, orderID, part); err != nil {
 				if remaining > 0 {
 					req.Lots = remaining
 					e.hedges.Add(req, err)
@@ -593,6 +712,7 @@ func (e *Engine) placeHedge(ctx context.Context, req model.OrderRequest) error {
 				return nil
 			}
 			size = min(size, remaining)
+			shrinking = shrinking && size >= e.config.RejectRetryMinLots
 			continue
 		}
 		lastErr = err
@@ -609,10 +729,10 @@ func (e *Engine) placeHedge(ctx context.Context, req model.OrderRequest) error {
 			return nil
 		}
 		if shrinking {
-			if size == 1 {
+			if size-e.config.RejectRetryLotStep < e.config.RejectRetryMinLots {
 				shrinking = false
 			} else {
-				size = max(1, size-e.config.RejectRetryLotStep)
+				size -= e.config.RejectRetryLotStep
 			}
 		}
 	}
@@ -628,7 +748,14 @@ func (e *Engine) closeOrder(ctx context.Context, orderID string) (orders.Change,
 	if !ok {
 		return orders.Change{}, fmt.Errorf("cannot retire unknown order %q", orderID)
 	}
+	if snap.Done {
+		e.trade.CloseOrder(orderID)
+		return orders.Change{}, nil
+	}
 	result, cancelErr := e.broker.Cancel(ctx, orderID)
+	if cancelErr != nil && !e.orders.Closing(orderID) {
+		result, cancelErr = e.broker.Cancel(ctx, orderID)
+	}
 	if cancelErr != nil {
 		status, statusErr := e.broker.Status(ctx, orderID)
 		if statusErr != nil || !status.Done {
@@ -650,11 +777,35 @@ func (e *Engine) closeOrder(ctx context.Context, orderID string) (orders.Change,
 	return change, nil
 }
 
+func (e *Engine) resolveTrade(ctx context.Context, reason string) error {
+	clip, active := e.trade.Info()
+	if !active {
+		return nil
+	}
+	e.trade.Stop(e.settlement(clip.Plan))
+	return e.stopTrade(ctx, reason, true)
+}
+
+func (e *Engine) settlement(plan Plan) trade.Settlement {
+	if !plan.IsClose && e.config.KeepPartialOpenOnTimeout {
+		return trade.Drop
+	}
+	if plan.IsClose && e.config.ForceCloseOnTimeout {
+		return trade.Complete
+	}
+	return trade.Resolve
+}
+
+func (e *Engine) completeTrade(ctx context.Context) error {
+	e.trade.Stop(trade.Complete)
+	return e.stopTrade(ctx, "target filled", true)
+}
+
 func (e *Engine) stopTrade(ctx context.Context, reason string, allowBalance bool) error {
 	if e.state.Info().Code == run.Stopped || e.hedges.UnknownCount() > 0 {
 		allowBalance = false
 	}
-	ids := e.trade.Stop()
+	ids := e.trade.Stop(trade.Drop)
 	var result error
 	for _, orderID := range ids {
 		change, err := e.closeOrder(ctx, orderID)
@@ -668,26 +819,43 @@ func (e *Engine) stopTrade(ctx context.Context, reason string, allowBalance bool
 	}
 	if !allowBalance {
 		e.state.NeedCheck(reason + ": placement outcome unknown")
+		// A cancelled ledger-based clip need not own the unknown hedge. Its
+		// request and provisional credit remain in the independent recovery list.
+		e.trade.DropSettled()
+		// A fully credited clip can be booked without another placement. The
+		// unknown-order barrier still blocks new exposure until confirmation.
+		if e.state.Info().Code != run.Stopped && len(e.orders.OrdersToClose()) == 0 && e.trade.Full() {
+			e.finishTrade(e.now)
+		}
 		if e.hedges.UnknownCount() == 0 {
 			e.trade.DropEmpty()
 		}
 		return result
 	}
+	if len(e.orders.OrdersToClose()) > 0 {
+		return result
+	}
 	if len(e.hedges.All()) == 0 {
 		result = errors.Join(result, e.hedgeTrade(ctx, model.RoleFix))
 	}
-	if e.trade.IsPaired() {
-		e.finishTrade(e.clock.Now(), true)
+	if len(e.hedges.All()) == 0 && e.hedges.UnknownCount() == 0 && e.trade.IsPaired() {
+		if !e.trade.DropSettled() {
+			e.finishTrade(e.now)
+		}
 	}
 	e.trade.DropEmpty()
 	return result
 }
 
-func (e *Engine) finishTrade(at time.Time, allowPartial bool) {
-	plan, ok := e.trade.Finish(allowPartial)
+func (e *Engine) finishTrade(at time.Time) {
+	plan, ok := e.trade.Finish(false)
 	if !ok {
 		return
 	}
+	e.commit(plan, at)
+}
+
+func (e *Engine) commit(plan Plan, at time.Time) {
 	e.strategy.Commit(plan, at)
 	if saver, ok := e.strategy.(Saver); ok {
 		saver.SaveLots()
@@ -773,11 +941,14 @@ func (e *Engine) fixWork(ctx context.Context, now time.Time) error {
 		didWork = didWork || err == nil || e.hedges.MarketCount() > pending
 	}
 	remaining := len(e.orders.OrdersToClose()) + len(e.hedges.All()) + e.hedges.MarketCount() + e.hedges.UnknownCount()
+	if e.state.Info().Code == run.Stopped {
+		remaining = len(e.orders.OrdersToClose())
+	}
 	e.state.FixDone(
 		now, remaining, didWork, e.config.RetryWait, e.config.RetryMax,
 	)
 	if e.trade.Full() {
-		e.finishTrade(now, false)
+		result = errors.Join(result, e.completeTrade(ctx))
 	}
 	return result
 }
@@ -791,8 +962,9 @@ func (e *Engine) placeFailed(err error, operation string) {
 	e.logger.Warnf("%s was definitively rejected: %v", operation, err)
 }
 
-func (e *Engine) halt(reason string) {
+func (e *Engine) halt(ctx context.Context, reason string) error {
 	if e.state.Stop(reason) {
 		e.logger.Criticalf("engine halted: %s", reason)
 	}
+	return e.stopTrade(ctx, "engine halted", false)
 }

@@ -227,6 +227,10 @@ func (g *Gateway) ResumePlacement(
 	if g.limit == nil || !g.limit.Take(1, execengine2.LimitMust) {
 		return "", execengine2.OrderUnknown(clientID, errors.Join(err, errors.New("send limit blocked retry")))
 	}
+	if !g.timeNow().Before(pending.deadline) {
+		g.forgetPlacement(clientID)
+		return "", execengine2.OrderUnknown(clientID, errors.Join(err, errors.New("client ID resend window expired")))
+	}
 	order, placeErr := g.api.Place(ctx, req, clientID)
 	if placeErr != nil {
 		if status.Code(placeErr) == codes.AlreadyExists {
@@ -321,6 +325,9 @@ func (g *Gateway) placeWithClientID(
 			}
 			if g.limit == nil || !g.limit.Take(1, limitKind) {
 				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, errors.New("send limit blocked retry")))
+			}
+			if !g.timeNow().Before(deadline) {
+				return "", lookupOnly, execengine2.OrderUnknown(clientID, errors.Join(sendErr, errors.New("client ID resend window expired")))
 			}
 		}
 		order, placeErr := g.api.Place(ctx, req, clientID)

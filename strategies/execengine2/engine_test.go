@@ -160,8 +160,8 @@ func TestTwoLimitsFirstFill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(f.broker.cancels) != 1 || f.broker.cancels[0] != "o2" {
-		t.Fatalf("cancels = %v, want [o2]", f.broker.cancels)
+	if len(f.broker.cancels) != 2 || f.broker.cancels[0] != "o2" || f.broker.cancels[1] != "o1" {
+		t.Fatalf("cancels = %v, want [o2 o1]", f.broker.cancels)
 	}
 	if len(f.broker.places) != 3 {
 		t.Fatalf("placement calls = %d, want 3", len(f.broker.places))

@@ -32,6 +32,9 @@ func (b *Book) Update(symbol string, at time.Time, bid, ask float64) bool {
 	default:
 		return false
 	}
+	if at.Before(target.At) {
+		return false
+	}
 	*target = model.Prices{Bid: bid, Ask: ask, At: at}
 	return true
 }

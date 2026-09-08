@@ -16,6 +16,10 @@ type Broker interface {
 }
 
 // SendLimit проверяет и сразу списывает попытки отправки заявки.
+// Optional Allow(int64) bool enables v1 admission: check first, then book each
+// RPC after its return with Take(..., LimitMust). Such a limit must accept that
+// mandatory booking, including a negative remaining balance. RetryAfter(int64)
+// time.Duration optionally supplies the quota-reset delay. Quota implements both.
 type SendLimit interface {
 	Take(ops int64, class LimitKind) bool
 	Remaining() int64

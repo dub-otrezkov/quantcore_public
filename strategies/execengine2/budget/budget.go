@@ -1,5 +1,5 @@
-// Package budget хранит общий лимит отправки заявок для одного счёта.
-// Время окна и опрос брокера находятся снаружи.
+// Package budget provides shared placement budgets. Use Quota for broker metrics
+// and automatic windows; Atomic is a fixed counter with explicit local resets.
 package budget
 
 import (
@@ -29,6 +29,16 @@ func New(limit, reserve int64) (*Atomic, error) {
 	return b, nil
 }
 
+// Allow checks a discretionary burst without charging attempts. Engines that
+// need v1 admission semantics book each actual RPC separately with LimitMust.
+func (b *Atomic) Allow(ops int64) bool {
+	if ops <= 0 {
+		return true
+	}
+	remaining := b.remaining.Load()
+	return remaining >= b.reserve && ops <= remaining-b.reserve
+}
+
 // Take одной атомарной операцией проверяет и списывает попытки.
 // Обязательный хедж может взять запас и увести счётчик ниже нуля.
 func (b *Atomic) Take(ops int64, class model.LimitKind) bool {
@@ -37,11 +47,10 @@ func (b *Atomic) Take(ops int64, class model.LimitKind) bool {
 	}
 	for {
 		current := b.remaining.Load()
-		next := current - ops
-		if class != model.LimitMust && next < b.reserve {
+		if class != model.LimitMust && (current < b.reserve || ops > current-b.reserve) {
 			return false
 		}
-		if b.remaining.CompareAndSwap(current, next) {
+		if b.remaining.CompareAndSwap(current, current-ops) {
 			return true
 		}
 	}
@@ -50,20 +59,6 @@ func (b *Atomic) Take(ops int64, class model.LimitKind) bool {
 // Reset начинает новое окно. Время окна хранится снаружи.
 func (b *Atomic) Reset(limit int64) {
 	b.remaining.Store(limit)
-}
-
-// SetIfLower применяет значение брокера только тогда, когда оно меньше локального.
-// Старый ответ брокера не может отменить уже сделанный Take.
-func (b *Atomic) SetIfLower(remaining int64) {
-	for {
-		current := b.remaining.Load()
-		if remaining >= current {
-			return
-		}
-		if b.remaining.CompareAndSwap(current, remaining) {
-			return
-		}
-	}
 }
 
 // Remaining возвращает остаток. Минус означает, что обязательный хедж

@@ -98,8 +98,8 @@ func TestMarketOpeningSendsBothLegsBeforeEitherReply(t *testing.T) {
 			t.Fatal("both legs must reach Broker.Place before either reply is released")
 		}
 	}
-	if !seen[execengine2.LegA] || !seen[execengine2.LegB] || f.budget.Remaining() != 18 {
-		t.Fatalf("opening legs=%v budget=%d, want both legs with two attempts reserved", seen, f.budget.Remaining())
+	if !seen[execengine2.LegA] || !seen[execengine2.LegB] || f.budget.Remaining() != 20 {
+		t.Fatalf("opening legs=%v budget=%d, attempts are charged after both replies as in v1", seen, f.budget.Remaining())
 	}
 	close(releaseA)
 	select {
@@ -140,6 +140,7 @@ func TestMarketOpeningAccountsForSuccessfulLegAfterOtherRejects(t *testing.T) {
 			rejected := errors.New("opening rejected")
 			f := newTestSet(t, func(cfg *execengine2.Config, broker *fakeBroker) {
 				cfg.Mode = execengine2.ModeMarket
+				cfg.HedgeTries = 2 // the initial parallel attempt counts toward the limit
 				broker.placeFunc = func(_ context.Context, req execengine2.OrderRequest, call int) (string, error) {
 					if call <= 2 && req.Leg == rejectedLeg {
 						return "", execengine2.NotPlaced(rejected)

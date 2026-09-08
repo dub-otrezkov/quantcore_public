@@ -73,3 +73,32 @@ func TestPositionChecksPreserveOutstandingRetries(t *testing.T) {
 		t.Fatal("stopped state allowed a retry")
 	}
 }
+
+func TestStoppedCancelRetriesKeepBackoffAndKillSwitch(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	var m run.State
+	m.StartFix(now, time.Second, "old hedge debt")
+	m.Stop("manual kill switch")
+	if m.FixDue(now.Add(time.Hour)) {
+		t.Fatal("Stop retained the old recovery timer")
+	}
+	// Cancel failed during shutdown: only the caller's cancel work is allowed,
+	// but it still needs a bounded retry cadence while Stopped stays latched.
+	m.StartFix(now, time.Second, "shutdown cancel unresolved")
+	if m.FixDue(now) || !m.FixDue(now.Add(time.Second)) || m.CanOpen() {
+		t.Fatal("stopped cancellation has no retry pacing")
+	}
+	if m.Stop("repeat stop") || !m.FixDue(now.Add(time.Second)) {
+		t.Fatal("repeating Stop discarded outstanding cancellation work")
+	}
+	m.FixDone(now.Add(time.Second), 1, false, time.Second, 4*time.Second)
+	if m.FixDue(now.Add(2*time.Second)) || !m.FixDue(now.Add(3*time.Second)) {
+		t.Fatal("stopped cancellation did not back off after failure")
+	}
+	m.FixDone(now.Add(3*time.Second), 0, true, time.Second, 4*time.Second)
+	if m.FixDue(now.Add(time.Hour)) || m.Info().Code != run.Stopped ||
+		m.Info().Reason != "manual kill switch" || m.CheckPositions(0, 0, 0, 0, false) {
+		t.Fatal("finished cancellation cleared the kill switch or retained a retry")
+	}
+}

@@ -69,6 +69,7 @@ func newHedgeRetryTest(t *testing.T, step, tries int) (*Engine, *hedgeRetryBroke
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.quotes.Update("B", time.Now(), 200, 201)
 	return e, broker, limit, updates
 }
 
@@ -391,7 +392,7 @@ func TestHedgeRejectLadderAndOrdinaryAttemptsAreBounded(t *testing.T) {
 	}{
 		{name: "disabled", step: 0, want: []int{5, 5}},
 		{name: "shrinking", step: 2, want: []int{5, 3, 1, 5, 5}},
-		{name: "floor", step: 10, want: []int{5, 1, 5, 5}},
+		{name: "floor", step: 10, want: []int{5, 5, 5}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			e, broker, limit, updates := newHedgeRetryTest(t, test.step, 2)

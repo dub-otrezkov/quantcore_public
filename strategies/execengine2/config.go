@@ -16,14 +16,18 @@ type Config struct {
 	Mode  Mode
 	Ratio int
 
-	BookMaxAge       time.Duration
-	PriceWait        time.Duration
-	MinRest          time.Duration
-	TradeTimeout     time.Duration
-	RetryWait        time.Duration
-	RetryMax         time.Duration
-	MarketCheckAfter time.Duration
-	MarketCheckEvery time.Duration
+	BookMaxAge               time.Duration
+	PriceWait                time.Duration
+	MinRest                  time.Duration
+	TradeTimeout             time.Duration
+	ForceCloseOnTimeout      bool
+	KeepPartialOpenOnTimeout bool
+	DisableRepeg             bool
+	PullOnStaleBook          bool
+	RetryWait                time.Duration
+	RetryMax                 time.Duration
+	MarketCheckAfter         time.Duration
+	MarketCheckEvery         time.Duration
 	// HedgeTries bounds ordinary attempts at the remaining hedge size. When
 	// RejectRetryLotStep is positive, these follow the finite shrinking ladder.
 	HedgeTries int
@@ -31,6 +35,7 @@ type Config struct {
 	// Opening entries keep their requested size; mandatory hedges accumulate
 	// accepted chunks toward the full obligation. Zero disables the ladder.
 	RejectRetryLotStep int
+	RejectRetryMinLots int
 
 	LogTag string
 }
@@ -59,6 +64,9 @@ func (c Config) normalized() Config {
 	}
 	if c.HedgeTries == 0 {
 		c.HedgeTries = 1
+	}
+	if c.RejectRetryMinLots == 0 {
+		c.RejectRetryMinLots = 1
 	}
 	return c
 }
@@ -92,8 +100,8 @@ func (c Config) validate() error {
 	if c.HedgeTries < 1 {
 		return errors.New("hedge retries must be at least one")
 	}
-	if c.RejectRetryLotStep < 0 {
-		return errors.New("reject retry lot step must not be negative")
+	if c.RejectRetryLotStep < 0 || c.RejectRetryMinLots < 1 {
+		return errors.New("reject retry step must be non-negative and minimum lots positive")
 	}
 	return nil
 }

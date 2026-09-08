@@ -1,6 +1,7 @@
 package budget_test
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,11 @@ func TestTakeKeepsReserve(t *testing.T) {
 	}
 	if got := b.Remaining(); got != -1 {
 		t.Fatalf("remaining = %d, want -1", got)
+	}
+	// An exhausted mandatory reserve must not wrap into a discretionary credit.
+	b.Take(1, execengine2.LimitMust)
+	if b.Allow(math.MaxInt64) || b.Take(math.MaxInt64, execengine2.LimitNormal) || b.Remaining() != -2 {
+		t.Fatal("exhausted reserve admitted an overflowing discretionary request")
 	}
 }
 
@@ -53,25 +59,6 @@ func TestTakeIsAtomic(t *testing.T) {
 	}
 	if got := b.Remaining(); got != 0 {
 		t.Fatalf("remaining = %d, want 0", got)
-	}
-}
-
-func TestOldBrokerValueCannotRaiseLimit(t *testing.T) {
-	t.Parallel()
-	b, err := budget.New(20, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !b.Take(3, execengine2.LimitNormal) {
-		t.Fatal("take failed")
-	}
-	b.SetIfLower(20) // stale snapshot from before the take
-	if got := b.Remaining(); got != 17 {
-		t.Fatalf("remaining = %d, want 17", got)
-	}
-	b.SetIfLower(12)
-	if got := b.Remaining(); got != 12 {
-		t.Fatalf("remaining after conservative clamp = %d, want 12", got)
 	}
 }
 

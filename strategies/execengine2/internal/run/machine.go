@@ -47,16 +47,16 @@ type State struct {
 // CanOpen проверяет, можно ли начать новую сделку.
 func (m *State) CanOpen() bool { return m.code == Ready }
 
-// StartFix запрещает новые сделки и ставит работу на повтор.
+// StartFix запрещает новые сделки и ставит работу на повтор. После Stop таймер
+// обслуживает только отмены; разрешённые эффекты выбирает вызывающий движок.
 func (m *State) StartFix(now time.Time, firstWait time.Duration, reason string) {
-	if m.code == Stopped {
-		return
-	}
 	if firstWait <= 0 {
 		firstWait = time.Second
 	}
-	m.code = Fixing
-	m.reason = reason
+	if m.code != Stopped {
+		m.code = Fixing
+		m.reason = reason
+	}
 	if m.wait <= 0 {
 		m.wait = firstWait
 	}
@@ -67,7 +67,7 @@ func (m *State) StartFix(now time.Time, firstWait time.Duration, reason string) 
 
 // FixDue проверяет время следующей попытки.
 func (m *State) FixDue(now time.Time) bool {
-	return m.code != Stopped && !m.nextTry.IsZero() && !now.Before(m.nextTry)
+	return !m.nextTry.IsZero() && !now.Before(m.nextTry)
 }
 
 // FixDone выбирает время следующей попытки или просит проверить позиции.
@@ -78,12 +78,14 @@ func (m *State) FixDone(
 	firstWait time.Duration,
 	maxWait time.Duration,
 ) {
-	if m.code == Stopped || m.nextTry.IsZero() {
+	if m.nextTry.IsZero() {
 		return
 	}
 	if left == 0 {
-		m.code = CheckNeeded
-		m.reason = "broker work is done; position check is needed"
+		if m.code != Stopped {
+			m.code = CheckNeeded
+			m.reason = "broker work is done; position check is needed"
+		}
 		m.nextTry = time.Time{}
 		m.wait = 0
 		return

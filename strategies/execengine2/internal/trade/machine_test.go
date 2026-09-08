@@ -109,12 +109,12 @@ func TestBadRatioReturnsError(t *testing.T) {
 func TestPriceChangeWait(t *testing.T) {
 	t.Parallel()
 	m, now := startDual(t, 2)
-	touch := execengine2.Prices{Bid: 98, Ask: 99}
+	touch := execengine2.Prices{Bid: 100, Ask: 101}
 	if _, ok := m.NewPrice(execengine2.LegA, touch, now.Add(time.Second), 2*time.Second, 2*time.Second); ok {
 		t.Fatal("repeg ignored min rest")
 	}
 	candidate, ok := m.NewPrice(execengine2.LegA, touch, now.Add(3*time.Second), 2*time.Second, 2*time.Second)
-	if !ok || candidate.Request.Price != 98 {
+	if !ok || candidate.Request.Price != 100 {
 		t.Fatalf("candidate = %+v, ok=%v", candidate, ok)
 	}
 	m.CloseOrder("a1")
@@ -122,7 +122,7 @@ func TestPriceChangeWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := m.NewPrice(
-		execengine2.LegA, execengine2.Prices{Bid: 97, Ask: 98},
+		execengine2.LegA, execengine2.Prices{Bid: 101, Ask: 102},
 		now.Add(4*time.Second), 2*time.Second, 0,
 	); ok {
 		t.Fatal("repeg ignored per-leg throttle")

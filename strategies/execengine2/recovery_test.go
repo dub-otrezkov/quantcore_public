@@ -279,19 +279,19 @@ func TestStoppingClipRespectsCancelRetryWait(t *testing.T) {
 	if err := f.engine.OnTick(context.Background(), f.now.Add(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.broker.cancels) != 2 {
+	if len(f.broker.cancels) != 4 {
 		t.Fatalf("stopping clip bypassed cancel backoff: %v", f.broker.cancels)
 	}
 	if err := f.engine.OnBook(context.Background(), "A", f.now.Add(2*time.Second), 98, 99); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.broker.cancels) != 2 {
+	if len(f.broker.cancels) != 4 {
 		t.Fatalf("stale book bypassed cancel backoff: %v", f.broker.cancels)
 	}
 	if err := f.engine.OnTick(context.Background(), f.now.Add(time.Second)); err == nil {
 		t.Fatal("scheduled cancels were not retried")
 	}
-	if len(f.broker.cancels) != 4 {
+	if len(f.broker.cancels) != 6 {
 		t.Fatalf("scheduled cancel retries=%v", f.broker.cancels)
 	}
 }
