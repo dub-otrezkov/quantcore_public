@@ -25,9 +25,10 @@ type Check struct {
 
 // CheckResult — итог проверки рыночной заявки.
 type CheckResult struct {
-	Known   bool
-	Done    bool
-	Missing model.OrderRequest
+	Known    bool
+	Done     bool
+	RetryNow bool
+	Missing  model.OrderRequest
 }
 
 // Work — копия хеджа, который надо отправить позже.
@@ -45,10 +46,12 @@ type workItem struct {
 
 // List можно использовать с нулевым значением. Его карты не выходят из пакета.
 type List struct {
-	market  map[string]*market
-	work    map[uint64]*workItem
-	unknown []Unknown
-	nextID  uint64
+	market     map[string]*market
+	work       map[uint64]*workItem
+	unknown    []Unknown
+	nextID     uint64
+	deadStreak int
+	confirmed  bool
 }
 
 func (m *List) init() {
@@ -83,13 +86,23 @@ func (m *List) SeeFill(orderID string, filled int) bool {
 		return false
 	}
 	delete(m.market, orderID)
+	// v1 observes stream confirmation in its next watchdog pass, not OnFill.
+	m.confirmed = true
 	return true
+}
+
+// ConfirmFills applies stream confirmations at the next tick or signal, as v1 does.
+func (m *List) ConfirmFills() {
+	if m.confirmed {
+		m.deadStreak, m.confirmed = 0, false
+	}
 }
 
 // Checks returns due market orders and backs off each unresolved order. Pending
 // responses and partial fills keep that schedule; a terminal status or full fill
 // removes it. A delayed event loop schedules from now, without catch-up bursts.
 func (m *List) Checks(now time.Time, wait, firstEvery, maxEvery time.Duration) []Check {
+	m.ConfirmFills()
 	if firstEvery <= 0 {
 		firstEvery = time.Second
 	}
@@ -131,7 +144,11 @@ func (m *List) SetStatus(orderID string, status model.OrderStatus) CheckResult {
 	}
 	delete(m.market, orderID)
 	result := CheckResult{Known: true, Done: status.Filled >= p.order.Lots}
-	if status.Filled < p.order.Lots {
+	if result.Done {
+		m.deadStreak = 0
+	} else {
+		m.deadStreak = min(m.deadStreak+1, 3)
+		result.RetryNow = m.deadStreak < 3
 		result.Missing = p.order
 		result.Missing.Role = model.RoleFix
 		result.Missing.Lots = p.order.Lots - max(status.Filled, 0)

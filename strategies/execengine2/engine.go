@@ -128,7 +128,7 @@ func (e *Engine) OnBook(
 	if !ok {
 		return nil
 	}
-	gate, checkOnly := e.limit.(interface{ Allow(int64) bool })
+	gate, checkOnly := e.limit.(Admitter)
 	allowed := false
 	if checkOnly {
 		allowed = gate.Allow(1)
@@ -177,6 +177,9 @@ func (e *Engine) OnSignal(ctx context.Context, state Signal) error {
 		return errors.New("nil context")
 	}
 	e.advanceNow(state.Time)
+	if e.state.Info().Code != run.Stopped {
+		e.hedges.ConfirmFills()
+	}
 	if !e.state.CanOpen() {
 		return nil
 	}
@@ -211,21 +214,26 @@ func (e *Engine) OnSignal(ctx context.Context, state Signal) error {
 }
 
 func (e *Engine) openLimitsOrMarket(ctx context.Context, plan Plan, mode Mode, lots, count int, at time.Time) error {
-	// Quota-aware limits preserve v1's two-op admission and charge only actual RPCs.
-	// Custom reservation-only SendLimits retain their existing atomic Take contract.
-	gate, checkOnly := e.limit.(interface{ Allow(int64) bool })
+	gate, checkOnly := e.limit.(Admitter)
+	ops := int64(count)
+	if checkOnly {
+		// v1 requires two slots even for a solo maker: headroom for its future
+		// taker hedge, not the clip's order count. Allow reserves nothing; each
+		// actual RPC is charged below. Reservation-only limits take count slots.
+		ops = 2
+	}
 opening:
 	for {
 		allowed := false
 		if checkOnly {
-			allowed = gate.Allow(2)
+			allowed = gate.Allow(ops)
 		} else {
-			allowed = e.limit.Take(int64(count), model.LimitNormal)
+			allowed = e.limit.Take(ops, model.LimitNormal)
 		}
 		if !allowed {
 			delay := e.config.RetryWait
-			if quota, ok := e.limit.(interface{ RetryAfter(int64) time.Duration }); ok {
-				if wait := quota.RetryAfter(2); wait > 0 {
+			if quota, ok := e.limit.(RetryDelayer); ok {
+				if wait := quota.RetryAfter(ops); wait > 0 {
 					delay = wait
 				}
 			}
@@ -307,28 +315,35 @@ func (e *Engine) OnFill(ctx context.Context, fill Fill) error {
 }
 
 // OnOrderStatus принимает состояние заявки напрямую от брокера.
+// For v1-compatible order streams, Done is the old dead flag (Finam IsDeadStatus:
+// cancellation/rejection/expiry); Filled is the broker's cumulative executed
+// count, including fills not yet delivered by OnFill. FILLED/EXECUTED events use
+// Done=false and are handled by OnFill, as in v1. Do not replace this stream
+// filter with Broker.Status's broader terminal flag. A newly dead maker pulls a
+// working clip without Commit; an existing settlement keeps its chosen policy.
+// The confirmed terminal count avoids another Cancel for that ID.
 func (e *Engine) OnOrderStatus(ctx context.Context, orderID string, status OrderStatus) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
 	snap, own := e.orders.Info(orderID)
-	if !own {
+	if !own || !status.Done {
 		return nil
 	}
 	if snap.Request.Kind == model.OrderMarket {
 		return e.useMarketStatus(ctx, orderID, status)
 	}
-	if !status.Done {
-		return nil
-	}
 	change := e.orders.Close(orderID, status.Filled)
-	wasCurrent := e.trade.CloseOrder(orderID)
+	if clip, active := e.trade.Info(); active && !snap.Done &&
+		(clip.OpenA && clip.OrderA == orderID || clip.OpenB && clip.OrderB == orderID) {
+		// Retire in the same A-then-B accounting order as cancellation. The
+		// known terminal result replaces that leg's RPC, not its ledger position.
+		return e.stopTrade(ctx, "resting maker became terminal", true, change)
+	}
+	e.trade.CloseOrder(orderID)
 	e.sendChange(change, "maker terminal status")
 	if change.Lots != 0 {
 		e.trade.AddFill(orderID, change.Lots)
-	}
-	if wasCurrent && !snap.Done {
-		return e.stopTrade(ctx, "resting maker became terminal", true)
 	}
 	return nil
 }
@@ -667,7 +682,7 @@ func (e *Engine) placeHedgeAttempts(ctx context.Context, req model.OrderRequest,
 		return errors.New("engine halted")
 	}
 	remaining := req.Lots
-	_, chargeAfter := e.limit.(interface{ Allow(int64) bool })
+	_, chargeAfter := e.limit.(Admitter)
 	size := remaining
 	shrinking := canShrink && e.config.RejectRetryLotStep > 0 && size >= e.config.RejectRetryMinLots
 	var lastErr error
@@ -801,14 +816,22 @@ func (e *Engine) completeTrade(ctx context.Context) error {
 	return e.stopTrade(ctx, "target filled", true)
 }
 
-func (e *Engine) stopTrade(ctx context.Context, reason string, allowBalance bool) error {
+func (e *Engine) stopTrade(ctx context.Context, reason string, allowBalance bool, terminal ...orders.Change) error {
 	if e.state.Info().Code == run.Stopped || e.hedges.UnknownCount() > 0 {
 		allowBalance = false
 	}
 	ids := e.trade.Stop(trade.Drop)
 	var result error
 	for _, orderID := range ids {
-		change, err := e.closeOrder(ctx, orderID)
+		var change orders.Change
+		var err error
+		if len(terminal) > 0 && terminal[0].Order.ID == orderID {
+			change = terminal[0]
+			e.trade.CloseOrder(orderID)
+			e.sendChange(change, "maker terminal status")
+		} else {
+			change, err = e.closeOrder(ctx, orderID)
+		}
 		if err != nil {
 			result = errors.Join(result, err)
 			continue
@@ -863,7 +886,7 @@ func (e *Engine) commit(plan Plan, at time.Time) {
 	e.logger.Infof("committed clip action=%d lots=%d position=%d", plan.Action, plan.Lots, e.strategy.Position())
 }
 
-func (e *Engine) useMarketStatus(_ context.Context, orderID string, status model.OrderStatus) error {
+func (e *Engine) useMarketStatus(ctx context.Context, orderID string, status model.OrderStatus) error {
 	if snap, ok := e.orders.Info(orderID); ok && status.Done && status.Filled < snap.Filled {
 		// A terminal acknowledgement cannot erase executions already proved by
 		// the fill stream. Size the replacement from the same count the order
@@ -887,6 +910,11 @@ func (e *Engine) useMarketStatus(_ context.Context, orderID string, status model
 		}
 	}
 	if result.Missing.Lots > 0 {
+		if result.RetryNow && e.state.Info().Code != run.Stopped {
+			// Pay only this proven shortfall. placeHedge owns retries and queues
+			// any unplaced remainder; unrelated recovery work keeps its schedule.
+			return e.placeHedge(ctx, result.Missing)
+		}
 		e.hedges.Add(result.Missing, nil)
 		e.state.StartFix(e.clock.Now(), e.config.RetryWait, "taker executed fewer lots than requested")
 		e.logger.Warnf(

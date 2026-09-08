@@ -10,6 +10,14 @@ import (
 	"QuantCore/strategies/execengine2/budget"
 )
 
+var (
+	_ execengine2.SendLimit    = (*budget.Atomic)(nil)
+	_ execengine2.Admitter     = (*budget.Atomic)(nil)
+	_ execengine2.SendLimit    = (*budget.Quota)(nil)
+	_ execengine2.Admitter     = (*budget.Quota)(nil)
+	_ execengine2.RetryDelayer = (*budget.Quota)(nil)
+)
+
 func TestTakeKeepsReserve(t *testing.T) {
 	t.Parallel()
 	b, err := budget.New(10, 3)

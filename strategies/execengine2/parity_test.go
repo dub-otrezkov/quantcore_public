@@ -20,6 +20,7 @@ type parityOrder struct {
 	Price         float64
 	Filled        int
 	Reported      int
+	Done          bool
 }
 type parityTransport struct {
 	mu              sync.Mutex
@@ -43,6 +44,7 @@ func (b *parityTransport) place(sym, kind string, buy bool, lots int, price floa
 	b.orders = append(b.orders, parityOrder{ID: id, Sym: sym, Kind: kind, Buy: buy, Lots: lots, Price: price})
 	if kind == "market" {
 		b.orders[len(b.orders)-1].Filled = lots
+		b.orders[len(b.orders)-1].Done = true
 	}
 	b.calls = append(b.calls, fmt.Sprintf("place %s %s buy=%v lots=%d price=%g", sym, kind, buy, lots, price))
 	return id, nil
@@ -55,15 +57,17 @@ func (b *parityTransport) cancel(id string) (int, error) {
 				b.orders[i].Filled++
 				b.catch = false
 			}
+			b.orders[i].Done = true
 			return b.orders[i].Filled, nil
 		}
 	}
 	panic(id)
 }
 func (b *parityTransport) status(id string) (int, bool, error) {
+	b.calls = append(b.calls, "status "+id)
 	for _, r := range b.orders {
 		if r.ID == id {
-			return r.Filled, r.Kind == "market", nil
+			return r.Filled, r.Done, nil
 		}
 	}
 	panic(id)
@@ -261,6 +265,9 @@ func (e *parityEngine) fillOrder(index, n int, price float64) {
 	r := &e.b.orders[index]
 	r.Reported += n
 	r.Filled = max(r.Filled, r.Reported)
+	if r.Filled == r.Lots {
+		r.Done = true
+	}
 	e.fillEvents++
 	if e.old != nil {
 		e.old.OnFill(e.parityClock.now, r.ID, r.Sym, r.Buy, n, price)
@@ -270,6 +277,27 @@ func (e *parityEngine) fillOrder(index, n int, price float64) {
 			side = v2.SideBuy
 		}
 		e.error(e.new.OnFill(context.Background(), v2.Fill{FillID: fmt.Sprint(e.fillEvents), OrderID: r.ID, Symbol: r.Sym, Side: side, Lots: n, Price: price, At: e.parityClock.now}))
+	}
+}
+
+func (e *parityEngine) orderStatus(index int, dead bool) {
+	defer e.observe()
+	if index >= len(e.b.orders) {
+		e.t.Fatal("cannot replay a status: missing broker order")
+	}
+	r := &e.b.orders[index]
+	if dead {
+		r.Done = true
+	}
+	// The maker stream maps CANCELLED/REJECTED/EXPIRED to v1 dead and v2 Done.
+	// FILLED/EXECUTED map to false: OnFill will account and commit those orders.
+	// This differs from Broker.Status, where Done is generic terminality. v1's
+	// dead flag has no count; v2 receives that count directly. Requested Lots
+	// remains unchanged when an order dies partially filled.
+	if e.old != nil {
+		e.old.OnOrderStatus(r.ID, dead)
+	} else {
+		e.error(e.new.OnOrderStatus(context.Background(), r.ID, v2.OrderStatus{Done: dead, Filled: r.Filled}))
 	}
 }
 
@@ -294,16 +322,8 @@ func (e *parityEngine) parityOutcome() parityOutcome {
 		} else {
 			r.BrokerB += sign * o.Filled
 		}
-		if o.Kind == "limit" && o.Filled < o.Lots {
-			cancelled := false
-			for _, call := range e.b.calls {
-				if call == "cancel "+o.ID {
-					cancelled = true
-				}
-			}
-			if !cancelled {
-				r.LiveMakers++
-			}
+		if o.Kind == "limit" && !o.Done && o.Filled < o.Lots {
+			r.LiveMakers++
 		}
 	}
 	if e.old != nil {
@@ -342,7 +362,10 @@ func runParityCase(t *testing.T, old bool, name string) []parityOutcome {
 		e.s.action = -1
 		e.s.close = true
 		e.s.position = 6
-	case "fresh_hedge_price", "taker_amend":
+	case "fresh_hedge_price", "taker_amend", "taker_dead_short_same_event", "taker_dead_streak":
+		c1.SoloMakerLeg = true
+		c2.Mode = v2.ModeLimitA
+	case "maker_terminal_partial", "maker_terminal_unfilled", "maker_filled_status_before_fill":
 		c1.SoloMakerLeg = true
 		c2.Mode = v2.ModeLimitA
 	case "ratio_leg_b", "ratio_two_limits":
@@ -457,6 +480,47 @@ func runParityCase(t *testing.T, old bool, name string) []parityOutcome {
 	case "taker_amend":
 		e.fill(6)
 		e.fillOrder(1, 6, 199)
+	case "maker_terminal_partial", "maker_terminal_unfilled", "maker_terminal_dual":
+		if name == "maker_terminal_partial" {
+			e.fill(1)
+		}
+		e.orderStatus(0, false)
+		e.orderStatus(0, true)
+		e.orderStatus(0, true)
+	case "maker_filled_status_before_fill":
+		maker := &e.b.orders[0]
+		maker.Filled, maker.Done = maker.Lots, true
+		e.orderStatus(0, false) // FILLED is terminal at the broker, but not dead in the stream.
+		e.fill(maker.Lots)
+	case "maker_dead_b_before_stream":
+		e.b.orders[0].Filled = 1
+		e.b.orders[1].Filled = 3
+		e.orderStatus(1, true)
+		e.orderStatus(1, true)
+		e.fillOrder(0, 1, 99)
+		e.fillOrder(1, 3, 203)
+	case "taker_dead_short_same_event":
+		e.fill(6)
+		e.b.orders[1].Filled = 2
+		e.orderStatus(1, true)
+		e.orderStatus(1, true)
+		e.parityClock.now = e.base.Add(time.Second)
+		e.tick(e.parityClock.now)
+		e.parityClock.now = e.base.Add(2 * time.Second)
+		e.tick(e.parityClock.now)
+	case "taker_dead_streak":
+		e.fill(6)
+		for order := 1; order <= 3; order++ {
+			if order >= len(e.b.orders) {
+				t.Fatalf("dead taker %d did not create its immediate replacement", order-1)
+			}
+			e.b.orders[order].Filled = 0
+			e.orderStatus(order, true)
+		}
+		e.parityClock.now = e.base.Add(time.Second)
+		e.tick(e.parityClock.now)
+		e.parityClock.now = e.base.Add(2 * time.Second)
+		e.tick(e.parityClock.now)
 	}
 	if len(e.errors) > 0 {
 		t.Logf("v2 returned: %v", e.errors)

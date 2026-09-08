@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"QuantCore/strategies/execengine"
+	"QuantCore/trade/quota"
 
 	"github.com/FinamWeb/finam-trade-api/go/grpc/tradeapi/v1/orders"
 	"google.golang.org/grpc/codes"
@@ -307,17 +308,18 @@ func TestPlacerLogLinesCarryLogTag(t *testing.T) {
 
 // setOnlyQuota implements ONLY QuotaUpdater's own two methods — not execengine.Limiter's
 // Allow/Spend — to prove RefreshQuota is wired against the narrow QuotaUpdater surface, not
-// the concrete execengine.QuotaLimiter type or the full Limiter interface.
+// the concrete quota.QuotaLimiter type or the full Limiter interface.
 type setOnlyQuota struct {
 	remaining int
 	resetAt   time.Time
-	token     execengine.QuotaToken
+	token     quota.QuotaToken
 }
 
-func (s *setOnlyQuota) Snapshot() execengine.QuotaToken { return s.token }
+func (s *setOnlyQuota) Snapshot() quota.QuotaToken { return s.token }
 
-func (s *setOnlyQuota) Set(remaining int, resetAt, _ time.Time, token execengine.QuotaToken) {
+func (s *setOnlyQuota) Set(remaining int, resetAt, _ time.Time, token quota.QuotaToken) {
 	s.remaining, s.resetAt, s.token = remaining, resetAt, token
 }
 
 var _ QuotaUpdater = (*setOnlyQuota)(nil)
+var _ QuotaUpdater = (*quota.QuotaLimiter)(nil)

@@ -35,7 +35,8 @@ type harnessEngine interface {
 	OnBook(symbol string, at time.Time, bid, ask float64)
 	OnSignal(at time.Time)
 	OnFill(tradeID, orderID, symbol string, buy bool, lots int, price float64, at time.Time)
-	OnOrderStatus(orderID string, filled int, done bool)
+	// dead is finambroker.IsDeadStatus; FILLED/EXECUTED are handled by OnFill.
+	OnOrderStatus(orderID string, filled int, dead bool)
 	OnTick(time.Time)
 	StopTrade()
 	Stop(reason string)
@@ -68,8 +69,8 @@ func (a *v1EngineAdapter) OnFill(
 	}
 }
 
-func (a *v1EngineAdapter) OnOrderStatus(orderID string, _ int, done bool) {
-	a.engine.OnOrderStatus(orderID, done)
+func (a *v1EngineAdapter) OnOrderStatus(orderID string, _ int, dead bool) {
+	a.engine.OnOrderStatus(orderID, dead)
 }
 
 func (a *v1EngineAdapter) OnTick(at time.Time) { a.engine.OnTick(at) }
@@ -119,10 +120,10 @@ func (a *v2EngineAdapter) OnFill(
 	})
 }
 
-func (a *v2EngineAdapter) OnOrderStatus(orderID string, filled int, done bool) {
+func (a *v2EngineAdapter) OnOrderStatus(orderID string, filled int, dead bool) {
 	_ = a.engine.OnOrderStatus(context.Background(), orderID, execengine2.OrderStatus{
 		Filled: filled,
-		Done:   done,
+		Done:   dead,
 	})
 }
 

@@ -16,13 +16,25 @@ type Broker interface {
 }
 
 // SendLimit проверяет и сразу списывает попытки отправки заявки.
-// Optional Allow(int64) bool enables v1 admission: check first, then book each
-// RPC after its return with Take(..., LimitMust). Such a limit must accept that
-// mandatory booking, including a negative remaining balance. RetryAfter(int64)
-// time.Duration optionally supplies the quota-reset delay. Quota implements both.
+// A limit that also implements Admitter uses its check-then-book contract instead.
 type SendLimit interface {
 	Take(ops int64, class LimitKind) bool
 	Remaining() int64
+}
+
+// Admitter is the optional SendLimit contract for v1-compatible admission.
+// Allow checks without spending; the engine books each actual RPC after its
+// return with Take(..., LimitMust). Mandatory booking must succeed even when
+// the remaining balance becomes negative. As with all Go interfaces, a matching
+// method satisfies this contract structurally; no registration is required.
+type Admitter interface {
+	Allow(ops int64) bool
+}
+
+// RetryDelayer optionally gives a denied SendLimit's delay for the same number
+// of attempts it just checked. The engine adds this delay to its event time.
+type RetryDelayer interface {
+	RetryAfter(ops int64) time.Duration
 }
 
 // Clock даёт движку текущее время.

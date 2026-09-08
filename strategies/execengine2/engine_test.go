@@ -344,19 +344,76 @@ func TestMarketShortFillGetsHedge(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.broker.places) != 3 || f.engine.Code() != execengine2.StateFixing {
-		t.Fatalf("shortfall was not deferred: calls=%d state=%s", len(f.broker.places), f.engine.Code())
+	if len(f.broker.places) != 4 || f.broker.places[3].req.Lots != 1 ||
+		f.broker.places[3].req.Role != execengine2.RoleFix || f.engine.Info().Hedges != 0 {
+		t.Fatalf("shortfall was not hedged in the status event: info=%+v calls=%+v", f.engine.Info(), f.broker.places)
 	}
+	if len(f.sink.positions) != 4 || f.sink.positions[2].Lots != 1 || f.sink.positions[3].Lots != -1 {
+		t.Fatalf("shortfall accounting = %+v", f.sink.positions)
+	}
+	if err := f.engine.OnOrderStatus(context.Background(), "o3", execengine2.OrderStatus{Filled: 1, Done: true}); err != nil {
+		t.Fatal(err)
+	}
+	fill := execengine2.Fill{FillID: "late-taker", OrderID: "o3", Lots: 1, Price: 198}
+	for range 2 {
+		if err := f.engine.OnFill(context.Background(), fill); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(f.sink.prices) != 1 || f.sink.prices[0].OrderID != "o3" ||
+		f.sink.prices[0].Lots != 1 || f.sink.prices[0].From != 199 || f.sink.prices[0].To != 198 {
+		t.Fatalf("late execution did not amend exactly once: %+v", f.sink.prices)
+	}
+	if err := f.engine.OnOrderStatus(context.Background(), "o4", execengine2.OrderStatus{Filled: 1, Done: true}); err != nil {
+		t.Fatal(err)
+	}
+	cancels, statuses := len(f.broker.cancels), len(f.broker.statuses)
 	f.clock.now = f.now.Add(time.Second)
 	if err := f.engine.OnTick(context.Background(), f.clock.now); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.broker.places) != 4 || f.broker.places[3].req.Lots != 1 ||
-		f.broker.places[3].req.Role != execengine2.RoleFix {
-		t.Fatalf("shortfall hedge calls = %+v", f.broker.places)
+	a, b := inventory(f.sink)
+	if len(f.broker.places) != 4 || len(f.broker.cancels) != cancels || len(f.broker.statuses) != statuses ||
+		len(f.sink.positions) != 4 || a != 2 || b != -2 || f.engine.Info().Hedges != 0 {
+		t.Fatalf("terminal replay or retry duplicated the repair: info=%+v calls=%+v inventory=(%d,%d)", f.engine.Info(), f.broker.places, a, b)
 	}
-	if len(f.sink.positions) != 4 || f.sink.positions[2].Lots != 1 || f.sink.positions[3].Lots != -1 {
-		t.Fatalf("shortfall accounting = %+v", f.sink.positions)
+}
+
+func TestNonDeadMarketStatusWaitsForFillStream(t *testing.T) {
+	t.Parallel()
+	f := newTestSet(t, nil)
+	ctx := context.Background()
+	if err := f.engine.OnSignal(ctx, execengine2.Signal{Time: f.now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.engine.OnFill(ctx, execengine2.Fill{FillID: "maker", OrderID: "o1", Lots: 2, Price: 99}); err != nil {
+		t.Fatal(err)
+	}
+	before := f.engine.Info()
+	if before.MarketOrders != 1 || len(f.sink.positions) != 2 || len(f.sink.prices) != 0 {
+		t.Fatalf("expected an accepted, unconfirmed hedge: info=%+v deltas=%+v", before, f.sink.positions)
+	}
+	places, cancels, statuses := len(f.broker.places), len(f.broker.cancels), len(f.broker.statuses)
+	// Finam FILLED/EXECUTED stream statuses carry the v1 dead=false flag.
+	if err := f.engine.OnOrderStatus(ctx, "o3", execengine2.OrderStatus{Filled: 2, Done: false}); err != nil {
+		t.Fatal(err)
+	}
+	if f.engine.Info() != before || len(f.sink.positions) != 2 || len(f.sink.prices) != 0 ||
+		len(f.broker.places) != places || len(f.broker.cancels) != cancels || len(f.broker.statuses) != statuses {
+		t.Fatalf("non-dead status changed the hedge: info=%+v deltas=%+v", f.engine.Info(), f.sink.positions)
+	}
+	if err := f.engine.OnFill(ctx, execengine2.Fill{FillID: "hedge", OrderID: "o3", Lots: 2, Price: 198}); err != nil {
+		t.Fatal(err)
+	}
+	a, b := inventory(f.sink)
+	if f.engine.Info().MarketOrders != 0 || len(f.sink.positions) != 2 || a != 2 || b != -2 ||
+		len(f.broker.places) != places || len(f.broker.cancels) != cancels || len(f.broker.statuses) != statuses {
+		t.Fatalf("fill did not confirm the existing hedge: info=%+v inventory=(%d,%d)", f.engine.Info(), a, b)
+	}
+	if len(f.sink.prices) != 1 || f.sink.prices[0] != (execengine2.PriceChange{
+		OrderID: "o3", Symbol: "B", Lots: 2, From: 199, To: 198,
+	}) {
+		t.Fatalf("actual fill amendment = %+v", f.sink.prices)
 	}
 }
 

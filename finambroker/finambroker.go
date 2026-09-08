@@ -19,6 +19,7 @@ import (
 	"QuantCore/modlog"
 	"QuantCore/strategies/execengine"
 	"QuantCore/trade/finam"
+	"QuantCore/trade/quota"
 )
 
 // mlog shares execengine's own log (logs/execengine.log): these messages — ghost-order
@@ -356,13 +357,13 @@ const (
 )
 
 // QuotaUpdater is the narrow surface RefreshQuota needs from a rate limiter: feed it the
-// broker's latest remaining budget. Deliberately NOT execengine.QuotaLimiter — RefreshQuota
+// broker's latest remaining budget. Deliberately NOT quota.QuotaLimiter — RefreshQuota
 // only needs to Set numbers, not the limiter's Allow/Spend policy, so any Limiter
 // implementation (or a test double) can be wired up here without this adapter needing to
 // know its concrete type.
 type QuotaUpdater interface {
-	Snapshot() execengine.QuotaToken
-	Set(remaining int, resetAt, now time.Time, token execengine.QuotaToken)
+	Snapshot() quota.QuotaToken
+	Set(remaining int, resetAt, now time.Time, token quota.QuotaToken)
 }
 
 // RefreshQuota polls Finam's placeOrder usage quota and feeds it to lim until ctx ends,

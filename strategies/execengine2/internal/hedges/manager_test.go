@@ -2,6 +2,7 @@ package hedges_test
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -163,5 +164,86 @@ func TestMarketCheckBackoffCannotOverflow(t *testing.T) {
 		if checks := m.Checks(next.Add(-time.Nanosecond), time.Second, firstEvery, maxEvery); len(checks) != 0 {
 			t.Fatal("large retry cap overflowed into an early poll")
 		}
+	}
+}
+
+func TestTerminalShortfallRetriesStopAtThirdAndFullStatusResets(t *testing.T) {
+	t.Parallel()
+	var m hedges.List
+	for i, filled := range []int{3, -1, 0, 0} {
+		id := fmt.Sprint(i)
+		if err := m.AddMarket(id, hedgeRequest(5), time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		if r := m.SetStatus(id, execengine2.OrderStatus{Filled: filled}); !r.Known || r.RetryNow || r.Missing.Lots != 0 {
+			t.Fatalf("pending status changed retry policy: %+v", r)
+		}
+		r := m.SetStatus(id, execengine2.OrderStatus{Filled: filled, Done: true})
+		if !r.Known || r.Done || r.RetryNow != (i < 2) || r.Missing.Lots != 5-max(filled, 0) {
+			t.Fatalf("shortfall %d: %+v", i+1, r)
+		}
+		// Replays, including a contradictory full count, cannot move the streak.
+		if r := m.SetStatus(id, execengine2.OrderStatus{Filled: 5, Done: true}); r.Known || r.RetryNow {
+			t.Fatalf("terminal replay was counted: %+v", r)
+		}
+	}
+	if err := m.AddMarket("confirmed", hedgeRequest(5), time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.SetStatus("confirmed", execengine2.OrderStatus{Filled: 99, Done: true}); !r.Done || r.RetryNow || r.Missing.Lots != 0 {
+		t.Fatalf("full status did not confirm placed volume: %+v", r)
+	}
+	if err := m.AddMarket("after-confirmation", hedgeRequest(5), time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.SetStatus("after-confirmation", execengine2.OrderStatus{Done: true}); !r.RetryNow {
+		t.Fatalf("full status did not reset the streak: %+v", r)
+	}
+}
+
+func TestStreamConfirmationResetsStreakAtNextWatchdog(t *testing.T) {
+	t.Parallel()
+	for _, signal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("signal=%v", signal), func(t *testing.T) {
+			var m hedges.List
+			terminal := func(id string, filled int) hedges.CheckResult {
+				t.Helper()
+				if err := m.AddMarket(id, hedgeRequest(5), time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				return m.SetStatus(id, execengine2.OrderStatus{Filled: filled, Done: true})
+			}
+			flush := func() {
+				if signal {
+					m.ConfirmFills()
+				} else {
+					m.Checks(time.Time{}, time.Second, time.Second, time.Minute)
+				}
+			}
+			terminal("dead1", 0)
+			terminal("dead2", 0)
+			if err := m.AddMarket("stream", hedgeRequest(5), time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			if m.SeeFill("stream", 4) || terminal("after-partial", 0).RetryNow {
+				t.Fatal("partial stream confirmation reset the streak")
+			}
+			if !m.SeeFill("stream", 5) || m.SeeFill("stream", 5) || terminal("before-watchdog", 0).RetryNow {
+				t.Fatal("full stream confirmation must reset only in the next watchdog pass")
+			}
+			// Another full status resets now, but must retain the unobserved stream
+			// confirmation: v1 will still process that order in its next watchdog.
+			terminal("full-status", 5)
+			terminal("new-dead1", 0)
+			terminal("new-dead2", 0)
+			flush()
+			if !terminal("after-watchdog1", 0).RetryNow {
+				t.Fatal("watchdog lost the pending stream confirmation")
+			}
+			flush()
+			if !terminal("after-watchdog2", 0).RetryNow || terminal("after-watchdog3", 0).RetryNow {
+				t.Fatal("one stream confirmation reset the streak more than once")
+			}
+		})
 	}
 }

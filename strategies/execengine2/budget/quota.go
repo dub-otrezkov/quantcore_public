@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"QuantCore/strategies/execengine"
 	"QuantCore/strategies/execengine2/internal/model"
+	"QuantCore/trade/quota"
 )
 
 // Quota adapts the existing quota window and metrics accounting to SendLimit.
@@ -14,7 +14,7 @@ import (
 // Separate Allow and mandatory Take preserve v1's check-then-book contract.
 type Quota struct {
 	mu      sync.Mutex
-	limiter *execengine.QuotaLimiter
+	limiter *quota.QuotaLimiter
 	now     func() time.Time
 }
 
@@ -24,7 +24,7 @@ func NewQuota(limit, reserve int, window time.Duration) (*Quota, error) {
 	if limit <= 0 || reserve < 0 || window <= 0 {
 		return nil, errors.New("quota needs a positive limit/window and nonnegative reserve")
 	}
-	q := &Quota{limiter: execengine.NewQuotaLimiterBudget(reserve, limit, window), now: time.Now}
+	q := &Quota{limiter: quota.NewQuotaLimiterBudget(reserve, limit, window), now: time.Now}
 	q.limiter.Spend(q.now(), 0)
 	return q, nil
 }
@@ -67,14 +67,14 @@ func (q *Quota) Take(ops int64, class model.LimitKind) bool {
 }
 
 // Snapshot must be captured before starting a quota metrics request.
-func (q *Quota) Snapshot() execengine.QuotaToken {
+func (q *Quota) Snapshot() quota.QuotaToken {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.limiter.Snapshot()
 }
 
 // Set retains sends made during the request and rejects superseded windows.
-func (q *Quota) Set(remaining int, resetAt, now time.Time, token execengine.QuotaToken) {
+func (q *Quota) Set(remaining int, resetAt, now time.Time, token quota.QuotaToken) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.limiter.Set(remaining, resetAt, now, token)

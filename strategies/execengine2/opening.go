@@ -13,7 +13,7 @@ import (
 )
 
 // openMarket joins both broker calls before applying either result. The caller
-// has already reserved both attempts and started the trade in the event loop.
+// has already admitted both attempts and started the trade in the event loop.
 func (e *Engine) openMarket(ctx context.Context, requests []model.OrderRequest, at time.Time, chargeAfter bool) error {
 	if len(requests) != 2 {
 		return errors.New("market opening requires exactly two orders")

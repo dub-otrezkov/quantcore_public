@@ -161,6 +161,8 @@ type CancelResult struct {
 }
 
 // OrderStatus — текущее состояние заявки у брокера.
+// Filled is cumulative executed lots, not a delta. Broker.Status uses Done for
+// all terminal outcomes; Engine.OnOrderStatus documents the v1 stream filter.
 type OrderStatus struct {
 	Filled int
 	Done   bool

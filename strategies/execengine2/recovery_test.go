@@ -96,24 +96,42 @@ func TestUnknownMarketLegResumesAndHedgesTerminalShortfall(t *testing.T) {
 	if err := f.engine.OnTick(context.Background(), f.clock.now); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.resumes) != 1 || f.engine.Info().UnknownOrders != 0 || f.engine.Info().Hedges != 1 {
-		t.Fatalf("terminal partial fill was not converted to debt: %+v", f.engine.Info())
+	if len(b.resumes) != 1 || f.engine.Info().UnknownOrders != 0 || f.engine.Info().Hedges != 0 {
+		t.Fatalf("terminal partial fill was not repaired during adoption: %+v", f.engine.Info())
 	}
 	if f.engine.CheckPositions(2, -1) {
 		t.Fatal("unfinished hedge passed reconciliation")
 	}
-	f.clock.now = f.now.Add(2 * time.Second)
-	if err := f.engine.OnTick(context.Background(), f.clock.now); err != nil {
-		t.Fatal(err)
-	}
 	if len(b.places) != 3 || b.places[2].req.Symbol != "B" || b.places[2].req.Lots != 1 {
-		t.Fatalf("wrong recovery volume: %+v", b.places)
+		t.Fatalf("wrong same-event recovery volume: %+v", b.places)
 	}
 	if f.engine.Position() != 2 || len(f.decider.commits) != 1 || f.engine.HasTrade() {
 		t.Fatalf("recovered clip was not committed once: %+v commits=%v", f.engine.Info(), f.decider.commits)
 	}
+	if err := f.engine.OnOrderStatus(context.Background(), "recovered-b", execengine2.OrderStatus{Done: true, Filled: 1}); err != nil {
+		t.Fatal(err)
+	}
+	fill := execengine2.Fill{FillID: "recovered-execution", OrderID: "recovered-b", Lots: 1, Price: 98}
+	for range 2 {
+		if err := f.engine.OnFill(context.Background(), fill); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(f.sink.prices) != 1 || f.sink.prices[0].OrderID != "recovered-b" ||
+		f.sink.prices[0].Lots != 1 || f.sink.prices[0].From != 99 || f.sink.prices[0].To != 98 {
+		t.Fatalf("resumed execution did not amend exactly once: %+v", f.sink.prices)
+	}
 	if err := f.engine.OnOrderStatus(context.Background(), "B-3", execengine2.OrderStatus{Done: true, Filled: 1}); err != nil {
 		t.Fatal(err)
+	}
+	cancels, statuses := len(b.cancels), len(b.statuses)
+	f.clock.now = f.now.Add(2 * time.Second)
+	if err := f.engine.OnTick(context.Background(), f.clock.now); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.places) != 3 || len(b.resumes) != 1 || len(b.cancels) != cancels || len(b.statuses) != statuses ||
+		len(f.decider.commits) != 1 || len(f.sink.positions) != 4 {
+		t.Fatalf("replay or tick repeated recovery: info=%+v calls=%+v deltas=%+v", f.engine.Info(), b.places, f.sink.positions)
 	}
 	if !f.engine.CheckPositions(2, -2) {
 		t.Fatalf("completed recovery stayed blocked: %+v", f.engine.Info())
