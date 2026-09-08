@@ -696,6 +696,13 @@ func (e *Engine) finishTrade(at time.Time, allowPartial bool) {
 }
 
 func (e *Engine) useMarketStatus(_ context.Context, orderID string, status model.OrderStatus) error {
+	if snap, ok := e.orders.Info(orderID); ok && status.Done && status.Filled < snap.Filled {
+		// A terminal acknowledgement cannot erase executions already proved by
+		// the fill stream. Size the replacement from the same count the order
+		// registry retains, or the difference would be hedged a second time.
+		e.logger.Criticalf("taker %s terminal count %d is below %d stream executions; retaining the stream count", orderID, status.Filled, snap.Filled)
+		status.Filled = snap.Filled
+	}
 	result := e.hedges.SetStatus(orderID, status)
 	if !result.Known {
 		return nil
